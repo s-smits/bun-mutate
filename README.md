@@ -53,7 +53,8 @@ Handles subprocess-spawning suites, unencoded sites, and schemata handoffs:
 
 - **Fast clones:** APFS Copy-on-Write (`cp -cRp`) on macOS and hardlinks (`cp -al`) on Linux, skipping gitignored directories and symlinking `node_modules`.
 - **Lazy LCOV & subprocess reachability pruning:** collects LCOV coverage for non-subprocess suites and runs one source-instrumented baseline pass across parent + child processes for subprocess suites (failing closed to unpruned baseline on any error).
-- **Lead-first + combined `--bail`:** runs the highest-efficiency suite first, batches remaining suites under `bun test --bail`, and re-verifies blamed kills solo.
+- **Lead-first + wave-chunked `--bail`:** runs the highest-efficiency suite first, chunks remaining suites into duration-bounded `bun test --bail` waves so large suite sets do not overflow combined timeouts, and re-verifies blamed kills solo.
+- **Resilient baseline qualification:** scales combined qualification timeouts by suite count, bisects failing groups in `O(log N)` steps, and retries transient parallel-load refusals once before isolating the failing suite.
 
 ## CLI Reference
 
@@ -76,8 +77,17 @@ Handles subprocess-spawning suites, unencoded sites, and schemata handoffs:
 ## Honesty & Verdicts
 
 - **Strict separation:** `survived` requires a clean pass (`false`) from every suite; timeouts, crashes, and missing verdicts without a confirmed kill report as `unread` and stay out of the mutation score (`killed / (killed + survived)`).
-- **Unmutated baseline refusal:** any suite that fails unmutated aborts the run rather than recording false kills.
+- **Unmutated baseline refusal:** any suite that fails unmutated is isolated and reported rather than recording false kills.
 - **Clustered triage:** survivors group by `file:line` with operator counts and source snippets.
+
+## Triaging Survivors (Simplify Before Testing)
+
+Treat a mutation sweep as both a **production and test simplification pass**, not a raw kill-rate chase. Before writing a test for a surviving cluster, audit it in order:
+
+1. **Is the production implementation bad, redundant, or over-engineered?** Surviving mutants frequently expose dead guards, unused sorting or tracking fields whose order no caller observes, duplicate lookups, or unreachable fallbacks. Simplifying or deleting the production code eliminates entire survivor clusters cleanly.
+2. **Is it a real defect or an inert test?** Fix live bugs structurally at their owning boundary, or repair an existing test fixture that short-circuited before reaching the branch it meant to exercise.
+3. **If no existing test surfaced this, is the behaviour—or the surrounding test—earning its keep?** When inspecting a survivor exposes duplicated cases, synthetic stubs, or narrow tests on incidental details, trim or consolidate weak test parts rather than layering more tests on top.
+4. **Pin only genuinely load-bearing invariants.** Prefer property, table, or end-to-end checks over narrow unit tests; retire proved equivalents and arid logging/formatting branches without adding tests, then re-run `--only <out-dir>/survivors.ids.txt` to confirm targeted lines flip from `survived` to `killed`.
 
 ## License
 

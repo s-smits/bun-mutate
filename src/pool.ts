@@ -94,7 +94,7 @@ export async function runLocalPool(opts: {
       let wait = qualifyWait.get(name);
       if (wait === undefined) {
         const paths = opts.suites.get(name) ?? [];
-        wait = qualifySuiteWithPruning(seat, name, paths, {
+        const qualifyOpts = {
           root: opts.root,
           files,
           originals: opts.originals,
@@ -103,7 +103,13 @@ export async function runLocalPool(opts: {
           prune: opts.prune,
           seconds: opts.seconds,
           localConc: baseConc,
-        }).then((res) => {
+        };
+        wait = (async () => {
+          let res = await qualifySuiteWithPruning(seat, name, paths, qualifyOpts);
+          if (res.refused !== null && Date.now() < opts.deadline) {
+            await Bun.sleep(200);
+            res = await qualifySuiteWithPruning(seat, name, paths, qualifyOpts);
+          }
           if (res.refused === null) {
             opts.localQualified.add(name);
             opts.durations.set(name, res.durationMs);
@@ -112,7 +118,7 @@ export async function runLocalPool(opts: {
             if (res.unreachedIds !== undefined) unreachedBySuite.set(name, res.unreachedIds);
           }
           return res.refused;
-        });
+        })();
         qualifyWait.set(name, wait);
       }
       const why = await wait;
