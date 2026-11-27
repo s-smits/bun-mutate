@@ -224,4 +224,14 @@ describe("verdictOf and reporting", () => {
       rmSync(dir, { recursive: true, force: true });
     }
   });
+
+  it("keeps the .agents and .claude skills identical and the root answered-survivors.tsv valid", () => {
+    const repo = join(import.meta.dir, "..");
+    const agentsSkill = readFileSync(join(repo, ".agents/skills/bun-mutate/SKILL.md"), "utf8");
+    const claudeSkill = readFileSync(join(repo, ".claude/skills/bun-mutate/SKILL.md"), "utf8");
+    expect(claudeSkill).toBe(agentsSkill);
+    expect(agentsSkill).toContain("name: bun-mutate");
+    expect(agentsSkill).toContain("answered-survivors.tsv");
+    expect(() => readAnswers(join(repo, "answered-survivors.tsv"))).not.toThrow();
+  });
 });

@@ -73,6 +73,7 @@ Handles subprocess-spawning suites, unencoded sites, and schemata handoffs:
 | `--cov-cache <dir>` / `--clones <prefix>` | Reuse mtime-validated coverage caches or clean clone directories. |
 | `--depth <n\|all>` / `--until <ISO\|HH:MM>` | Import-hop depth (default `all`, every test that reaches the file; `1` = direct importers + transitive fallback) and graceful deadline. |
 | `--old <suite>` / `--survivors` / `-q` | Compare against a baseline suite, list survivor/unread IDs, or quiet progress. |
+| `--recheck <jsonl>` | Rerun an earlier run's unanswered survivors and unread mutants at the current tree, re-anchored by source line and operator; exits `3` while any remain. |
 | `--answers <tsv>` | Ledger of answered survivors (default `answered-survivors.tsv` at the root; see below). |
 
 ## Honesty & Verdicts
@@ -81,6 +82,8 @@ Handles subprocess-spawning suites, unencoded sites, and schemata handoffs:
 - **Unmutated baseline refusal:** any suite that fails unmutated is isolated and reported rather than recording false kills.
 - **Clustered triage:** survivors group by `file:line` with operator counts and source snippets. Each result row records the suites that ran with its mutant active (`reached`; the rest skipped it because their coverage never reaches the line), and each cluster names them: a line some suite runs wants an assertion in one of them, and a line no suite reaches is a deletion candidate or wants an end-to-end entry point.
 - **Baseline retry:** a suite that fails unmutated under parallel load gets one retry at one worker and twice its wall before it is skipped.
+- **Rows carry their source line:** each result row records the trimmed line its mutant sat on, so the report, the ledger and `--recheck` read the line as it was when the mutant ran, not whatever sits at that line number after later edits.
+- **Awake for the run:** on macOS the run holds an idle-sleep assertion (`caffeinate -i -w <pid>`) until it exits. A closed lid on battery still sleeps the machine; mutants it interrupts read as unread, never as kills, and `--recheck` reruns them.
 
 ## Triaging Survivors (Simplify Before Testing)
 
@@ -89,7 +92,27 @@ Treat a mutation sweep as both a **production and test simplification pass**, no
 1. **Is the production implementation bad, redundant, or over-engineered?** Surviving mutants frequently expose dead guards, unused sorting or tracking fields whose order no caller observes, duplicate lookups, or unreachable fallbacks. Simplifying or deleting the production code eliminates entire survivor clusters cleanly.
 2. **Is it a real defect or an inert test?** Fix live bugs structurally at their owning boundary, or repair an existing test fixture that short-circuited before reaching the branch it meant to exercise.
 3. **If no existing test surfaced this, is the behaviour—or the surrounding test—earning its keep?** When inspecting a survivor exposes duplicated cases, synthetic stubs, or narrow tests on incidental details, trim or consolidate weak test parts rather than layering more tests on top.
-4. **Pin only genuinely load-bearing invariants.** Prefer property, table, or end-to-end checks over narrow unit tests; retire proved equivalents and arid logging/formatting branches without adding tests, then re-run `--only <out-dir>/survivors.ids.txt` to confirm targeted lines flip from `survived` to `killed`.
+4. **Pin only genuinely load-bearing invariants.** Prefer property, table, or end-to-end checks over narrow unit tests; retire proved equivalents and arid logging/formatting branches without adding tests, then confirm with `--recheck <out-dir>/results.jsonl`.
+
+### Rechecking After Edits
+
+A survivor is pinned by a test edit, which a `--diff` run never revisits, since `--diff` mutates changed source lines only. Mutant IDs are byte offsets, so `--only` goes stale as soon as anything above the line moves. `--recheck <results.jsonl>` takes the earlier run's survivors and unread mutants, finds each at the current tree by its recorded source line and operator (nearest its old line), and runs only those, writing fresh results to `.bun-mutate/recheck-<head>/`. Rows whose line was since changed or deleted are counted as gone; a `--diff` against the earlier run's commit mutates their new text. Answered survivors are skipped.
+
+```sh
+bun-mutate diff main                                   # survivors on changed lines
+# delete, simplify, add assertions, answer equivalents ...
+bun-mutate run --recheck .bun-mutate/diff-<head>/results.jsonl
+```
+
+### Equivalents That Recur
+
+These shapes survived real sweeps and were either proved equivalent or deleted as redundant:
+
+- **Tie-breaks on a stable sort.** `toSorted((a, b) => a.key - b.key || a.index - b.index)` breaks ties by the original index, which a stable sort already keeps: delete the tie-break and its `index` field.
+- **Loop starts the first turn forces.** `let [wins, losses] = [0, 0]` where zero wins can never satisfy the loop's test survives `0 -> 1` on `wins`: the first turn moves it to 1 either way. Answer it `equivalent`, citing the test that rules zero out.
+- **Unit conversions in waits.** `seconds * 1000 -> 1001` only stretches a timer by a thousandth. Answer it `equivalent` unless a boundary test reads that edge.
+- **Read narrowing that only saves work.** A flag that skips parsing some records before a fold survives when it is forced on, because reading everything is always correct. Answer it `equivalent` and say what the narrowing saves.
+- **A guard a single owner already enforces.** A catch around a write the owner's lock already refuses, or a limit check repeated before the owner's own abort, survives deletion. Delete the guard rather than pin it, and name the owner in the commit.
 
 ## Answered Survivors
 
@@ -100,6 +123,13 @@ Some survivors are not worth a test. Record each in `answered-survivors.tsv` at 
 - `unit-only`: it sits on a guard worth keeping that no table, property check or end-to-end flow can reach, so only a narrow unit test with stubs could kill it.
 
 The reason must be a sentence a reviewer can check. Answered survivors drop out of the report's clusters, the recheck IDs and the exit code, while the totals still count them. Rows match by source text, so line shifts keep an answer and any edit to the line retires it. A full `run` (no explicit files, no `--diff`) lists answers that no longer match a survivor in a mutated file, so the ledger stays current.
+
+## Agent Skill
+
+`bun-mutate` bundles a standalone skill describing the commands, the simplify-first triage funnel, and the `answered-survivors.tsv` ledger at both standard ADE locations:
+
+- `.agents/skills/bun-mutate/SKILL.md` (Antigravity, Codex, OpenCode, Cursor, and other `.agents`-compatible ADEs)
+- `.claude/skills/bun-mutate/SKILL.md` (Claude Code)
 
 ## License
 

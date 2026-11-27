@@ -27,6 +27,9 @@
   },
   "files": [
     "src",
+    ".agents",
+    ".claude",
+    "answered-survivors.tsv",
     "README.md",
     "LICENSE"
   ],

@@ -1,0 +1,2 @@
+path	label	source	kind	reason
+src/cli.ts	swap ?:	recheckPath !== null ? `recheck-${head}` : isDiff ? `diff-${head}` : `run-${head}`,	presentation	it swaps only the default output folder's name between diff and run passes, which each still resume their own rows
