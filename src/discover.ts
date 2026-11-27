@@ -459,7 +459,7 @@ export function buildTestIndex(
   root: string,
   opts?: { readonly depth?: number; readonly timings?: ReadonlyMap<string, number> },
 ): TestIndex {
-  const depth = opts?.depth ?? 1;
+  const depth = opts?.depth ?? Number.POSITIVE_INFINITY;
   const timings = opts?.timings ?? new Map<string, number>();
   const aliases = loadRepoAliases(root);
   const tests = discoverTestFiles(root);

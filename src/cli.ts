@@ -49,7 +49,7 @@ Options:
   --no-schemata            Disable in-process schemata (run every suite in isolated clones)
   --cov-cache <dir>        Cache baseline suite durations and LCOV coverage
   --clones <prefix>        Reusable directory prefix for isolated clones
-  --depth <n|all>          Import-hop depth for test selection (default: 1 with transitive fallback)
+  --depth <n|all>          Import-hop depth for test selection (default: all; 1 = direct importers with transitive fallback)
   --until <ISO|HH:MM>      Stop starting new mutants after deadline
   --old <suite>            (report) Compare a baseline suite against newer suites
   --survivors              (report) Print surviving and unread mutant IDs
@@ -330,7 +330,7 @@ async function handleRun(
   const rawDepth = strFlag(flags, "depth");
   const depth =
     rawDepth === null
-      ? 1
+      ? Number.POSITIVE_INFINITY
       : rawDepth === "all" || rawDepth === "infinity"
         ? Number.POSITIVE_INFINITY
         : intFlag(flags, "depth") ?? 1;

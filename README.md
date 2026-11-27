@@ -71,7 +71,7 @@ Handles subprocess-spawning suites, unencoded sites, and schemata handoffs:
 | `-j, --jobs <n>` / `--timeout <s>` | Parallel worker cap (`min(8, cores)`) and per-suite timeout cap (`300s`). |
 | `--all` / `--no-prune` / `--no-schemata` | Disable stop-at-kill, coverage pruning, or in-process schemata. |
 | `--cov-cache <dir>` / `--clones <prefix>` | Reuse mtime-validated coverage caches or clean clone directories. |
-| `--depth <n\|all>` / `--until <ISO\|HH:MM>` | Import-hop depth (`1` + transitive fallback) and graceful deadline. |
+| `--depth <n\|all>` / `--until <ISO\|HH:MM>` | Import-hop depth (default `all`, every test that reaches the file; `1` = direct importers + transitive fallback) and graceful deadline. |
 | `--old <suite>` / `--survivors` / `-q` | Compare against a baseline suite, list survivor/unread IDs, or quiet progress. |
 
 ## Honesty & Verdicts
