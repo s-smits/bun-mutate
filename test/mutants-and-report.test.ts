@@ -9,7 +9,9 @@ import {
   formatSurvivorClusters,
   freshSurvivors,
   mutantsFromSource,
+  readAnswers,
   recheckIdsOf,
+  routeOf,
   runMutationSpecs,
   survivorEntries,
   verdictOf,
@@ -134,6 +136,59 @@ describe("verdictOf and reporting", () => {
       expect(md.unread).toBe(1);
       expect(md.markdown).toContain("| `a.ts` | 1 | 3 | 1 | 25.0% | u, v |");
       expect(md.markdown).toContain(idsPath);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("drops answered survivors from the report and recheck IDs, lists stale answers, and routes the rest by the suites that run them", () => {
+    const dir = mkdtempSync(join(tmpdir(), "bm-answers-"));
+    try {
+      const src = ["export function f(x: number) {", "  if (x < 0) return 0;", "  return x > 1 ? x : 1;", "}"];
+      writeFileSync(join(dir, "a.ts"), src.join("\n"));
+      const rows: ResultRow[] = [
+        { id: "a.ts:40:< -> <=", file: "a.ts", line: 2, label: "< -> <=", killed: { u: false, v: false }, reached: ["u"] },
+        { id: "a.ts:60:> -> >=", file: "a.ts", line: 3, label: "> -> >=", killed: { u: false, v: false }, reached: [] },
+        { id: "a.ts:50:delete if", file: "a.ts", line: 2, label: "delete if", killed: { u: false, v: false }, reached: ["u"] },
+      ];
+      const ledger = join(dir, "answered-survivors.tsv");
+      const answer = (label: string, source: string, kind: string) =>
+        ["a.ts", label, source, kind, "x is never zero or below at any caller"].join("\t");
+      writeFileSync(
+        ledger,
+        [
+          "path\tlabel\tsource\tkind\treason",
+          answer("< -> <=", "if (x < 0) return 0;", "equivalent"),
+          answer("> -> >=", "return x > 2 ? x : 1;", "unit-only"),
+          "",
+        ].join("\n"),
+      );
+
+      const md = buildMarkdownReport({
+        root: dir,
+        heading: "# Test",
+        rows,
+        answered: readAnswers(ledger),
+        listStale: true,
+      });
+      expect([md.survived, md.open]).toEqual([3, 2]);
+      expect(md.recheckIds).toEqual(["a.ts:60:> -> >=", "a.ts:50:delete if"]);
+      expect(md.stale).toEqual(["a.ts  > -> >=  return x > 2 ? x : 1;"]);
+      expect(md.clusters).toEqual([
+        "- `a.ts:2  [1: delete if]  if (x < 0) return 0;`",
+        "  ran under `u`: assert it through one of these tests, or answer it",
+        "- `a.ts:3  [1: > -> >=]  return x > 1 ? x : 1;`",
+        "  no suite reaches its line: delete it, or reach it through an end-to-end entry point",
+      ]);
+      expect(routeOf(["a", "b", "c", "d"])).toStartWith("ran under `a`, `b`, `c` and 1 more:");
+      expect(formatSurvivorClusters(survivorEntries(dir, rows.map(({ reached: _, ...row }) => row)))).toHaveLength(2);
+
+      for (const kind of ["fine", "presentation"]) {
+        const bad = join(dir, `${kind}.tsv`);
+        writeFileSync(bad, `${["a.ts", "< -> <=", "x", kind, kind === "fine" ? "a checkable reason here" : "short"].join("\t")}\n`);
+        expect(() => readAnswers(bad)).toThrow("needs a kind (equivalent, presentation, unit-only)");
+      }
+      expect(readAnswers(join(dir, "missing.tsv")).size).toBe(0);
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }

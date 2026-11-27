@@ -34,6 +34,47 @@ export interface SurvivorEntry {
   readonly label: string;
   readonly source: string;
   readonly key: string;
+  readonly reached: readonly string[] | null;
+}
+
+export const ANSWER_KINDS: ReadonlySet<string> = new Set(["equivalent", "presentation", "unit-only"]);
+
+/**
+ * Reads a ledger of answered survivors: one tab-separated row per answer with columns `path`,
+ * `label`, `source` (the trimmed source line), `kind` and `reason`, under an optional header row.
+ * An `equivalent` survivor changes nothing observable, a `presentation` one changes only printed
+ * wording, and a `unit-only` one sits on a guard no table, property check or end-to-end flow can
+ * reach. Editing the line retires its answer, since the source no longer matches.
+ */
+export function readAnswers(path: string | null): ReadonlySet<string> {
+  if (path === null || !existsSync(path)) return new Set();
+  const rows = readFileSync(path, "utf8").split("\n").filter(Boolean);
+  return new Set(
+    rows
+      .filter((row, at) => !(at === 0 && row.startsWith("path\t")))
+      .map((row) => {
+        const [file = "", label = "", source = "", kind = "", reason = ""] = row.split("\t");
+        if (!ANSWER_KINDS.has(kind) || reason.trim().split(/\s+/u).length < 3) {
+          throw new Error(
+            `${path}: "${row}" needs a kind (${[...ANSWER_KINDS].join(", ")}) and a reason a reviewer can check`,
+          );
+        }
+        return `${file}  ${label}  ${source}`;
+      }),
+  );
+}
+
+export const survivorLineCount = (entries: readonly SurvivorEntry[]): number =>
+  new Set(entries.map(({ file, line }) => `${file}:${String(line)}`)).size;
+
+/** How to resolve a survivor given the suites that ran with it active. */
+export function routeOf(reached: readonly string[]): string {
+  if (reached.length === 0) {
+    return "no suite reaches its line: delete it, or reach it through an end-to-end entry point";
+  }
+  const named = reached.slice(0, 3).map((suite) => `\`${suite}\``);
+  const more = reached.length > 3 ? ` and ${String(reached.length - 3)} more` : "";
+  return `ran under ${named.join(", ")}${more}: assert it through one of these tests, or answer it`;
 }
 
 export function survivorEntries(
@@ -55,7 +96,8 @@ export function survivorEntries(
     }
     const source = sources.get(row.file)?.[row.line - 1]?.trim() ?? "";
     const key = `${row.file}  ${row.label}  ${source}`;
-    return [{ id: row.id, file: row.file, line: row.line, label: row.label, source, key }];
+    const reached = row.reached ?? null;
+    return [{ id: row.id, file: row.file, line: row.line, label: row.label, source, key, reached }];
   });
 }
 
@@ -87,7 +129,10 @@ export function formatSurvivorClusters(entries: readonly SurvivorEntry[]): strin
     for (const { label } of group) counts.set(label, (counts.get(label) ?? 0) + 1);
     const ops = [...counts].map(([label, n]) => (n > 1 ? `${label} x${String(n)}` : label)).join(", ");
     const snippet = first.source === "" ? "" : `  ${first.source}`;
-    return [`- \`${first.file}:${String(first.line)}  [${String(group.length)}: ${ops}]${snippet}\``];
+    const line = `- \`${first.file}:${String(first.line)}  [${String(group.length)}: ${ops}]${snippet}\``;
+    const known = group.flatMap(({ reached }) => (reached === null ? [] : [reached]));
+    if (known.length < group.length) return [line];
+    return [line, `  ${routeOf([...new Set(known.flat())])}`];
   });
 }
 
@@ -141,18 +186,31 @@ export function buildMarkdownReport(opts: {
   readonly rows: readonly ResultRow[];
   readonly untested?: readonly (readonly [string, number])[];
   readonly idsFile?: string | null;
+  readonly answered?: ReadonlySet<string>;
+  readonly listStale?: boolean;
 }): {
   readonly markdown: string;
   readonly killed: number;
   readonly survived: number;
+  readonly open: number;
   readonly unread: number;
   readonly score: number | null;
   readonly clusters: readonly string[];
   readonly recheckIds: readonly string[];
+  readonly stale: readonly string[];
 } {
-  const entries = survivorEntries(opts.root, opts.rows);
+  const answered = opts.answered ?? new Set<string>();
+  const all = survivorEntries(opts.root, opts.rows);
+  const entries = all.filter(({ key }) => !answered.has(key));
+  const answeredIds = new Set(all.filter(({ key }) => answered.has(key)).map(({ id }) => id));
+  const live = new Set(all.map(({ key }) => key));
+  const mutated = new Set(opts.rows.map(({ file }) => file));
+  const stale =
+    opts.listStale === true
+      ? [...answered].filter((key) => mutated.has(key.split("  ")[0] ?? "") && !live.has(key))
+      : [];
   const clusters = formatSurvivorClusters(entries);
-  const recheckIds = recheckIdsOf(opts.rows);
+  const recheckIds = recheckIdsOf(opts.rows).filter((id) => !answeredIds.has(id));
   const lines = [
     opts.heading,
     "",
@@ -177,9 +235,12 @@ export function buildMarkdownReport(opts: {
       lines.push(`No nearby test: \`${file}\` (${String(count)} mutants)`);
     }
   }
+  const open = entries.length;
   lines.push(
-    `Totals: ${String(opts.rows.length)} mutants (${String(killed)} killed, ${String(survived)} survived across ${String(clusters.length)} line(s), ${String(unread)} unread, score ${formatScore(killed, survived)})`,
+    `Totals: ${String(opts.rows.length)} mutants (${String(killed)} killed, ${String(survived)} survived, ${String(open)} unanswered across ${String(survivorLineCount(entries))} line(s), ${String(unread)} unread, score ${formatScore(killed, survived)})`,
   );
+  if (answeredIds.size > 0) lines.push(`Answered in the ledger: ${String(answeredIds.size)}`);
+  for (const key of stale) lines.push(`Stale answer, no such survivor now (delete the row): \`${key}\``);
   if (opts.idsFile !== null && opts.idsFile !== undefined && recheckIds.length > 0) {
     lines.push(`Recheck IDs (\`bun-mutate run --only\`): \`${opts.idsFile}\``);
   }
@@ -188,9 +249,11 @@ export function buildMarkdownReport(opts: {
     markdown: `${lines.join("\n")}\n`,
     killed,
     survived,
+    open,
     unread,
     score,
     clusters,
     recheckIds,
+    stale,
   };
 }

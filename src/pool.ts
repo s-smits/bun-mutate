@@ -107,8 +107,7 @@ export async function runLocalPool(opts: {
         wait = (async () => {
           let res = await qualifySuiteWithPruning(seat, name, paths, qualifyOpts);
           if (res.refused !== null && Date.now() < opts.deadline) {
-            await Bun.sleep(200);
-            res = await qualifySuiteWithPruning(seat, name, paths, qualifyOpts);
+            res = await qualifySuiteWithPruning(seat, name, paths, { ...qualifyOpts, seconds: 2 * opts.seconds, localConc: 1 });
           }
           if (res.refused === null) {
             opts.localQualified.add(name);

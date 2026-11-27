@@ -203,7 +203,8 @@ export async function runMutationSpecs(opts: RunOptions): Promise<RunSummary> {
 
   const rows: ResultRow[] = [];
   const madeDirs = new Set<string>();
-  const record = (item: TargetItem, killed: VerdictMap) => {
+  const priorReach = new Map<string, Set<string>>();
+  const record = (item: TargetItem, killed: VerdictMap, raw: Readonly<VerdictMap> = {}) => {
     const dir = dirname(item.out);
     if (!madeDirs.has(dir)) {
       mkdirSync(dir, { recursive: true });
@@ -215,6 +216,7 @@ export async function runMutationSpecs(opts: RunOptions): Promise<RunSummary> {
       line: item.mutant.line,
       label: item.mutant.label,
       killed,
+      reached: item.suites.filter((name) => name in raw || priorReach.get(item.mutant.id)?.has(name) === true),
     };
     appendFileSync(item.out, `${JSON.stringify(row)}\n`);
     rows.push(row);
@@ -339,6 +341,7 @@ export async function runMutationSpecs(opts: RunOptions): Promise<RunSummary> {
         schemataEncoded += res.encodedCount;
         for (const [name, ms] of res.durations) durations.set(name, ms);
         for (const [id, row] of res.verdicts) priorById.set(id, row);
+        for (const [id, names] of res.reached) priorReach.set(id, names);
         if (res.encodedCount > 0 && res.qualifiedSuites.size > 0) {
           let settledHere = 0;
           for (const item of items) {
@@ -417,7 +420,7 @@ async function runIsolatedPool(ctx: {
   readonly staleWarnings: readonly StaleOnlyWarning[];
   readonly schemataEncoded: number;
   readonly rows: ResultRow[];
-  readonly record: (item: TargetItem, killed: VerdictMap) => void;
+  readonly record: (item: TargetItem, killed: VerdictMap, raw?: Readonly<VerdictMap>) => void;
   readonly warn: (message: string) => void;
   readonly progress: (message: string) => void;
 }): Promise<RunSummary> {
@@ -534,7 +537,7 @@ async function runIsolatedPool(ctx: {
     onResult: (task, raw) => {
       const item = byId.get(task.plan.mutant.id);
       if (item !== undefined) {
-        record(item, finalizeRow(item.suites, priorById.get(item.mutant.id), raw, mode));
+        record(item, finalizeRow(item.suites, priorById.get(item.mutant.id), raw, mode), raw);
       }
     },
     warn,

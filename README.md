@@ -60,7 +60,7 @@ Handles subprocess-spawning suites, unencoded sites, and schemata handoffs:
 
 | Command / Flag | Description |
 | --- | --- |
-| `bun-mutate diff [base]` | Mutate changed lines since `[base]`. Exits `3` on survivors, unread mutants, or untested changed files. |
+| `bun-mutate diff [base]` | Mutate changed lines since `[base]`. Exits `3` on unanswered survivors, unread mutants, or untested changed files. |
 | `bun-mutate run [files...]` | Mutate specified files or all discovered source files. |
 | `bun-mutate list [files...]` | Print per-file mutant counts (supports `--diff [base]`). |
 | `bun-mutate report <jsonl...>` | Print per-file `killed / survived / unread` table and clustered `file:line` survivors. |
@@ -73,12 +73,14 @@ Handles subprocess-spawning suites, unencoded sites, and schemata handoffs:
 | `--cov-cache <dir>` / `--clones <prefix>` | Reuse mtime-validated coverage caches or clean clone directories. |
 | `--depth <n\|all>` / `--until <ISO\|HH:MM>` | Import-hop depth (default `all`, every test that reaches the file; `1` = direct importers + transitive fallback) and graceful deadline. |
 | `--old <suite>` / `--survivors` / `-q` | Compare against a baseline suite, list survivor/unread IDs, or quiet progress. |
+| `--answers <tsv>` | Ledger of answered survivors (default `answered-survivors.tsv` at the root; see below). |
 
 ## Honesty & Verdicts
 
 - **Strict separation:** `survived` requires a clean pass (`false`) from every suite; timeouts, crashes, and missing verdicts without a confirmed kill report as `unread` and stay out of the mutation score (`killed / (killed + survived)`).
 - **Unmutated baseline refusal:** any suite that fails unmutated is isolated and reported rather than recording false kills.
-- **Clustered triage:** survivors group by `file:line` with operator counts and source snippets.
+- **Clustered triage:** survivors group by `file:line` with operator counts and source snippets. Each result row records the suites that ran with its mutant active (`reached`; the rest skipped it because their coverage never reaches the line), and each cluster names them: a line some suite runs wants an assertion in one of them, and a line no suite reaches is a deletion candidate or wants an end-to-end entry point.
+- **Baseline retry:** a suite that fails unmutated under parallel load gets one retry at one worker and twice its wall before it is skipped.
 
 ## Triaging Survivors (Simplify Before Testing)
 
@@ -88,6 +90,16 @@ Treat a mutation sweep as both a **production and test simplification pass**, no
 2. **Is it a real defect or an inert test?** Fix live bugs structurally at their owning boundary, or repair an existing test fixture that short-circuited before reaching the branch it meant to exercise.
 3. **If no existing test surfaced this, is the behaviour—or the surrounding test—earning its keep?** When inspecting a survivor exposes duplicated cases, synthetic stubs, or narrow tests on incidental details, trim or consolidate weak test parts rather than layering more tests on top.
 4. **Pin only genuinely load-bearing invariants.** Prefer property, table, or end-to-end checks over narrow unit tests; retire proved equivalents and arid logging/formatting branches without adding tests, then re-run `--only <out-dir>/survivors.ids.txt` to confirm targeted lines flip from `survived` to `killed`.
+
+## Answered Survivors
+
+Some survivors are not worth a test. Record each in `answered-survivors.tsv` at the repository root, one tab-separated row per mutant under a `path\tlabel\tsource\tkind\treason` header, where `source` is the trimmed source line and `kind` is one of:
+
+- `equivalent`: the mutant changes nothing observable;
+- `presentation`: it changes only printed wording or layout;
+- `unit-only`: it sits on a guard worth keeping that no table, property check or end-to-end flow can reach, so only a narrow unit test with stubs could kill it.
+
+The reason must be a sentence a reviewer can check. Answered survivors drop out of the report's clusters, the recheck IDs and the exit code, while the totals still count them. Rows match by source text, so line shifts keep an answer and any edit to the line retires it. A full `run` (no explicit files, no `--diff`) lists answers that no longer match a survivor in a mutated file, so the ledger stays current.
 
 ## License
 

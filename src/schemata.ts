@@ -995,6 +995,7 @@ async function runSchemaShard(opts: {
 
 export interface SchemataResult {
   readonly verdicts: Map<string, Map<string, boolean | null>>;
+  readonly reached: Map<string, Set<string>>;
   readonly qualifiedSuites: Set<string>;
   readonly durations: Map<string, number>;
   readonly encodedCount: number;
@@ -1015,6 +1016,7 @@ export async function screenFileWithSchemata(opts: {
   readonly concurrency?: number;
 }): Promise<SchemataResult> {
   const verdicts = new Map<string, Map<string, boolean | null>>();
+  const reached = new Map<string, Set<string>>();
   const qualifiedSuites = new Set<string>();
   const durations = new Map<string, number>();
   let timedOutCount = 0;
@@ -1026,11 +1028,11 @@ export async function screenFileWithSchemata(opts: {
   const pureSuites = [...profiles.entries()].filter(([, p]) => !p.stateful).map(([n]) => n);
   const statefulSuites = [...profiles.entries()].filter(([, p]) => p.stateful).map(([n]) => n);
   if ((pureSuites.length === 0 && statefulSuites.length === 0) || opts.mutants.length === 0) {
-    return { verdicts, qualifiedSuites, durations, encodedCount: 0, timedOutCount: 0 };
+    return { verdicts, reached, qualifiedSuites, durations, encodedCount: 0, timedOutCount: 0 };
   }
   const built = buildSchemaSource(opts.file, opts.source, opts.mutants);
   if (built.source === null || built.encoded.size === 0) {
-    return { verdicts, qualifiedSuites, durations, encodedCount: 0, timedOutCount: 0 };
+    return { verdicts, reached, qualifiedSuites, durations, encodedCount: 0, timedOutCount: 0 };
   }
   const tmpDir = join(
     tmpdir(),
@@ -1167,6 +1169,7 @@ export async function screenFileWithSchemata(opts: {
         const row = verdicts.get(mutant.id) ?? new Map<string, boolean | null>();
         row.set(probe.suiteName, found);
         verdicts.set(mutant.id, row);
+        reached.set(mutant.id, (reached.get(mutant.id) ?? new Set()).add(probe.suiteName));
         if (found === false || (!opts.stopAtKill && found === true)) nextAlive.push(id);
       }
       alive = nextAlive;
@@ -1179,5 +1182,5 @@ export async function screenFileWithSchemata(opts: {
   } finally {
     rmSync(tmpDir, { recursive: true, force: true });
   }
-  return { verdicts, qualifiedSuites, durations, encodedCount: built.encoded.size, timedOutCount };
+  return { verdicts, reached, qualifiedSuites, durations, encodedCount: built.encoded.size, timedOutCount };
 }

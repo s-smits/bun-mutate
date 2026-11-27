@@ -16,10 +16,11 @@ import {
   formatReportTable,
   formatScore,
   formatSurvivorClusters,
+  survivorLineCount,
+  readAnswers,
   recheckIdsOf,
   rowsOf,
   survivorEntries,
-  verdictOf,
   writeSurvivorsFile,
 } from "./report.ts";
 import { runMutationSpecs } from "./runner.ts";
@@ -54,6 +55,7 @@ Options:
   --old <suite>            (report) Compare a baseline suite against newer suites
   --survivors              (report) Print surviving and unread mutant IDs
   --write-ids <file>       Write surviving and unread IDs for \`--only\`
+  --answers <tsv>          Ledger of answered survivors (default: answered-survivors.tsv at the root)
   --no-fail                Exit 0 even when survivors or unread mutants remain
   -q, --quiet              Suppress progress lines on stderr
   -h, --help               Show this help
@@ -80,6 +82,7 @@ const VALUE_FLAGS = new Set([
   "until",
   "old",
   "write-ids",
+  "answers",
 ]);
 
 const BOOL_FLAGS = new Set([
@@ -248,11 +251,19 @@ function handleList(root: string, files: readonly string[], flags: ReadonlyMap<s
   }
 }
 
+function answersOf(root: string, flags: ReadonlyMap<string, string | true>): ReadonlySet<string> {
+  const named = strFlag(flags, "answers");
+  return readAnswers(named === null ? join(root, "answered-survivors.tsv") : resolve(named));
+}
+
 function handleReport(root: string, jsonlFiles: readonly string[], flags: ReadonlyMap<string, string | true>): void {
   if (jsonlFiles.length === 0) die("report expects at least one JSONL file\n\n" + USAGE);
   const old = strFlag(flags, "old");
   const rows = jsonlFiles.flatMap(rowsOf);
-  const ids = recheckIdsOf(rows, old);
+  const answered = answersOf(root, flags);
+  const all = survivorEntries(root, rows);
+  const answeredIds = new Set(all.filter(({ key }) => answered.has(key)).map(({ id }) => id));
+  const ids = recheckIdsOf(rows, old).filter((id) => old !== null || !answeredIds.has(id));
   const writeIds = strFlag(flags, "write-ids");
   if (writeIds !== null && ids.length > 0) writeSurvivorsFile(writeIds, ids);
   if (flags.has("survivors")) {
@@ -261,11 +272,11 @@ function handleReport(root: string, jsonlFiles: readonly string[], flags: Readon
   }
   console.log(formatReportTable(rows, old));
   if (old === null) {
-    const entries = survivorEntries(root, rows);
+    const entries = all.filter(({ key }) => !answered.has(key));
     const clusters = formatSurvivorClusters(entries);
     if (clusters.length > 0) {
       console.log("");
-      console.log(`Survivors: ${String(entries.length)} across ${String(clusters.length)} line(s)`);
+      console.log(`Survivors: ${String(entries.length)} across ${String(survivorLineCount(entries))} line(s)`);
       for (const line of clusters) console.log(line);
     }
   }
@@ -408,26 +419,24 @@ async function handleRun(
   }
 
   const allRows = rowsOf(outPath);
-  const recheckIds = recheckIdsOf(allRows);
   const idsFile = strFlag(flags, "write-ids") ?? join(outDir, "survivors.ids.txt");
-  let wroteIds = false;
-  if (recheckIds.length > 0) {
-    wroteIds = writeSurvivorsFile(idsFile, recheckIds);
-  } else {
-    rmSync(idsFile, { force: true });
-  }
-
   const heading =
     diffRef !== null
       ? `# Mutation report at ${head} (diff since ${diffRef.slice(0, 12)})`
       : `# Mutation report at ${head}`;
-  const report = buildMarkdownReport({
-    root,
-    heading,
-    rows: allRows,
-    untested,
-    idsFile: wroteIds ? idsFile : null,
-  });
+  const reportOf = (ids: string | null) =>
+    buildMarkdownReport({
+      root,
+      heading,
+      rows: allRows,
+      untested,
+      idsFile: ids,
+      answered: answersOf(root, flags),
+      listStale: !isDiff && explicitFiles.length === 0,
+    });
+  const wroteIds = writeSurvivorsFile(idsFile, reportOf(null).recheckIds);
+  if (!wroteIds) rmSync(idsFile, { force: true });
+  const report = reportOf(wroteIds ? idsFile : null);
 
   if (outDirFlag !== null || outFlag === null) {
     writeFileSync(join(outDir, "report.md"), report.markdown);
@@ -475,12 +484,11 @@ async function handleRun(
     console.error(`${String(summary.unrun)} mutants left unrun; re-run to resume`);
     return 1;
   }
-  const hasGap = report.survived > 0 || report.unread > 0 || (isDiff && untested.length > 0);
+  const hasGap = report.open > 0 || report.unread > 0 || (isDiff && untested.length > 0);
   if ((isDiff || flags.has("fail-on-survivors")) && !flags.has("no-fail") && hasGap) {
     return 3;
   }
-  const allOk = allRows.every((row) => verdictOf(row.killed) === "killed");
-  return !allOk && flags.has("fail-on-survivors") && !flags.has("no-fail") ? 3 : 0;
+  return 0;
 }
 
 async function main(): Promise<void> {

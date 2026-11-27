@@ -18,6 +18,8 @@ export interface ResultRow {
   readonly line: number;
   readonly label: string;
   readonly killed: VerdictMap;
+  /** Suites that ran with the mutant active; the rest skipped it because their coverage never reaches its line. */
+  readonly reached?: readonly string[];
 }
 
 export interface TargetSpec {
