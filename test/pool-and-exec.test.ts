@@ -3,6 +3,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync,
 import { tmpdir } from "node:os";
 import { join, relative } from "node:path";
 import { chunkSuites, linkModules } from "../src/exec.ts";
+import { drainProcess } from "../src/proc.ts";
 import {
   measureCoverage,
   parseMultiFileBail,
@@ -13,6 +14,18 @@ import {
 } from "../src/index.ts";
 
 describe("Mode 2 process-isolated pool and execution invariants", () => {
+  it("reads a suite's output when it exits leaving a child that holds its pipes open", async () => {
+    const run = Bun.spawn(["sh", "-c", "sleep 60 & echo 1 fail; exit 1"], {
+      stdout: "pipe",
+      stderr: "pipe",
+      detached: true,
+    });
+    const started = Date.now();
+    const { said, code, signalled } = await drainProcess(run, 30);
+    expect({ said: said.trim(), code, signalled }).toEqual({ said: "1 fail", code: 1, signalled: false });
+    expect(Date.now() - started).toBeLessThan(5_000);
+  });
+
   it("parses multi-file --bail output accurately", () => {
     const suites = new Map<string, readonly string[]>([
       ["s1", ["test/s1.test.ts"]],

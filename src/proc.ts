@@ -72,6 +72,11 @@ export async function drainProcess(
       (parts) => parts.join(""),
     );
     const code = await run.exited;
+    try {
+      process.kill(-run.pid, "SIGKILL");
+    } catch {
+      // ESRCH: the suite left no process in its group to hold the pipes open.
+    }
     const said = await Promise.race([drain, Bun.sleep(200).then(() => "")]);
     return { said, code, signalled: timedOut || run.signalCode != null };
   } finally {
