@@ -221,7 +221,7 @@ export async function runMutationSpecs(opts: RunOptions): Promise<RunSummary> {
 
   // Shared lazy CoW/hardlink worker pool reused by both stateful schemata and isolated execution.
   let ephemeralRoot: string | null = null;
-  const preparedWorkers = new Map<number, LocalWorker>();
+  const preparedWorkers = new Map<number, Promise<LocalWorker>>();
   const head = gitMaybe(opts.root, "rev-parse", "HEAD");
   const stamp =
     (opts.clonesPrefix ?? null) !== null && head !== null && gitMaybe(opts.root, "status", "--porcelain") === ""
@@ -240,36 +240,31 @@ export async function runMutationSpecs(opts: RunOptions): Promise<RunSummary> {
       }
     }
     const base = cloneBase;
-    const toPrep: LocalWorker[] = [];
+    const promises: Promise<LocalWorker>[] = [];
     for (let id = 0; id < needed; id += 1) {
-      if (!preparedWorkers.has(id)) {
-        const w: LocalWorker = { id, clone: `${base}-${String(id)}` };
-        preparedWorkers.set(id, w);
-        toPrep.push(w);
+      let pending = preparedWorkers.get(id);
+      if (pending === undefined) {
+        const worker: LocalWorker = { id, clone: `${base}-${String(id)}` };
+        pending = (async () => {
+          const stampPath = join(worker.clone, STAMP_FILE);
+          const reusable = stamp !== null && existsSync(stampPath) && readFileSync(stampPath, "utf8") === stamp;
+          if (!reusable) {
+            await cloneTree(opts.root, worker.clone);
+            if (stamp !== null) writeFileSync(stampPath, stamp);
+          }
+          linkModules(opts.root, worker.clone);
+          for (const [file, text] of originals) {
+            const target = join(worker.clone, file);
+            rmSync(target, { force: true });
+            writeFileSync(target, text);
+          }
+          return worker;
+        })();
+        preparedWorkers.set(id, pending);
       }
+      promises.push(pending);
     }
-    await Promise.all(
-      toPrep.map(async (worker) => {
-        const stampPath = join(worker.clone, STAMP_FILE);
-        const reusable = stamp !== null && existsSync(stampPath) && readFileSync(stampPath, "utf8") === stamp;
-        if (!reusable) {
-          await cloneTree(opts.root, worker.clone);
-          if (stamp !== null) writeFileSync(stampPath, stamp);
-        }
-        linkModules(opts.root, worker.clone);
-        for (const [file, text] of originals) {
-          const target = join(worker.clone, file);
-          rmSync(target, { force: true });
-          writeFileSync(target, text);
-        }
-      }),
-    );
-    const out: LocalWorker[] = [];
-    for (let id = 0; id < needed; id += 1) {
-      const w = preparedWorkers.get(id);
-      if (w !== undefined) out.push(w);
-    }
-    return out;
+    return await Promise.all(promises);
   };
 
   const ensureSandboxes = async (): Promise<readonly string[]> => {
@@ -314,11 +309,15 @@ export async function runMutationSpecs(opts: RunOptions): Promise<RunSummary> {
   try {
     if (enableSchemata && Date.now() < deadline) {
       const schemataStart = Date.now();
-      const byFile = Map.groupBy(todo, (item) => item.mutant.file);
-      let fileIdx = 0;
-      for (const [file, items] of byFile) {
-        if (Date.now() >= deadline) break;
-        fileIdx += 1;
+      const entries = [...Map.groupBy(todo, (item) => item.mutant.file).entries()];
+      let completedFiles = 0;
+      const runOneFile = async (
+        file: string,
+        items: readonly TargetItem[],
+        fileConc: number,
+        sandboxSlice?: () => Promise<readonly string[]>,
+      ): Promise<void> => {
+        if (Date.now() >= deadline) return;
         const fileStart = Date.now();
         const suiteOrder = [...new Set(items.flatMap((item) => item.suites))];
         const res = await screenFileWithSchemata({
@@ -329,11 +328,12 @@ export async function runMutationSpecs(opts: RunOptions): Promise<RunSummary> {
           suites: allSuites,
           suiteOrder,
           helperFiles,
-          ensureSandboxes,
+          ensureSandboxes: sandboxSlice ?? ensureSandboxes,
           capSeconds: seconds,
           stopAtKill,
-          concurrency,
+          concurrency: fileConc,
         });
+        completedFiles += 1;
         schemataEncoded += res.encodedCount;
         for (const [name, ms] of res.durations) durations.set(name, ms);
         for (const [id, row] of res.verdicts) priorById.set(id, row);
@@ -348,9 +348,32 @@ export async function runMutationSpecs(opts: RunOptions): Promise<RunSummary> {
           }
           const fSec = ((Date.now() - fileStart) / 1000).toFixed(1);
           progress(
-            `schemata [${String(fileIdx)}/${String(byFile.size)}] ${file}: ${String(settledHere)}/${String(items.length)} settled in ${fSec}s`,
+            `schemata [${String(completedFiles)}/${String(entries.length)}] ${file}: ${String(settledHere)}/${String(items.length)} settled in ${fSec}s`,
           );
         }
+      };
+      const smallFiles = entries.filter(([, items]) => items.length <= 24);
+      const largeFiles = entries.filter(([, items]) => items.length > 24);
+      if (smallFiles.length > 0) {
+        const queue = [...smallFiles];
+        const width = Math.min(concurrency, queue.length);
+        const perFileConc = Math.max(1, Math.floor(concurrency / width));
+        await Promise.all(
+          Array.from({ length: width }, async (_, workerIdx) => {
+            const sliceSandboxes = async (): Promise<readonly string[]> => {
+              const all = await ensureSandboxes();
+              const start = workerIdx * perFileConc;
+              const slice = all.slice(start, start + perFileConc);
+              return slice.length > 0 ? slice : all.slice(workerIdx % all.length, (workerIdx % all.length) + 1);
+            };
+            for (let next = queue.shift(); next !== undefined; next = queue.shift()) {
+              await runOneFile(next[0], next[1], perFileConc, sliceSandboxes);
+            }
+          }),
+        );
+      }
+      for (const [file, items] of largeFiles) {
+        await runOneFile(file, items, concurrency);
       }
       if (schemataEncoded > 0 && durations.size > 0) {
         const sec = ((Date.now() - schemataStart) / 1000).toFixed(1);

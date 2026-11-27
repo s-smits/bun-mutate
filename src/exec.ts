@@ -669,7 +669,7 @@ export async function measureCoverage(
   if (cache !== null) mkdirSync(cache, { recursive: true });
   const queue = [...suites.entries()];
   const cores = opts.concurrency ?? availableParallelism();
-  const maxConc = Math.min(4, Math.max(2, Math.floor(cores / 3)));
+  const maxConc = 2;
   let seq = 0;
   const runOne = async ([name, paths]: readonly [string, readonly string[]]) => {
     const key = cacheKey(name);
@@ -713,7 +713,7 @@ export async function measureCoverage(
     }
   };
   try {
-    const slots = Math.min(Math.max(2, Math.floor(cores / 3)), queue.length);
+    const slots = Math.min(Math.max(2, Math.floor((cores * 2) / 3)), queue.length);
     await Promise.all(
       Array.from({ length: slots }, async () => {
         for (let next = queue.shift(); next !== undefined; next = queue.shift()) await runOne(next);

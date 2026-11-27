@@ -17,11 +17,28 @@ const SWAPS = new Map<string, string>([
   ["??", "&&"],
 ]);
 
+const ERROR_CTORS = new Set([
+  "Error",
+  "TypeError",
+  "RangeError",
+  "SyntaxError",
+  "ReferenceError",
+  "URIError",
+  "EvalError",
+]);
+
 const isConsoleCall = (node: ts.Node): boolean =>
   ts.isCallExpression(node) &&
   ts.isPropertyAccessExpression(node.expression) &&
   ts.isIdentifier(node.expression.expression) &&
   node.expression.expression.text === "console";
+
+const isErrorMessageArg = (node: ts.Node): boolean =>
+  node.parent !== undefined &&
+  ts.isNewExpression(node.parent) &&
+  ts.isIdentifier(node.parent.expression) &&
+  ERROR_CTORS.has(node.parent.expression.text) &&
+  node.parent.arguments?.[0] === node;
 
 export function isPropertyNameNode(node: ts.Node): boolean {
   const parent = node.parent;
@@ -46,7 +63,8 @@ const isInert = (node: ts.Node): boolean =>
   ts.isTemplateExpression(node) ||
   ts.isInterfaceDeclaration(node) ||
   ts.isTypeAliasDeclaration(node) ||
-  isConsoleCall(node);
+  isConsoleCall(node) ||
+  isErrorMessageArg(node);
 
 export function scriptKindFor(file: string): ts.ScriptKind {
   if (file.endsWith(".tsx")) return ts.ScriptKind.TSX;

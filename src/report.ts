@@ -91,12 +91,20 @@ export function formatSurvivorClusters(entries: readonly SurvivorEntry[]): strin
   });
 }
 
+const suitesInGroup = (group: readonly ResultRow[]): string =>
+  [...new Set(group.flatMap((row) => Object.keys(row.killed)))].join(", ");
+
 export function formatReportTable(rows: readonly ResultRow[], oldSuite: string | null = null): string {
   const columns = oldSuite === null ? ["killed", "survived", "unread"] : ["ON", "O-", "-N", "--", "unread"];
-  const lines = [["file", ...columns].join("  ")];
+  const header = oldSuite === null ? ["file", ...columns, "score", "suites"] : ["file", ...columns];
+  const lines = [header.join("  ")];
   for (const [file, group] of Map.groupBy(rows, (row) => row.file)) {
-    const counts = columns.map((kind) => String(group.filter((row) => classifyRow(row, oldSuite) === kind).length));
-    lines.push([file, ...counts].join("  "));
+    const counts = columns.map((kind) => group.filter((row) => classifyRow(row, oldSuite) === kind).length);
+    const tail =
+      oldSuite === null
+        ? [formatScore(counts[0] ?? 0, counts[1] ?? 0), suitesInGroup(group)]
+        : [];
+    lines.push([file, ...counts.map(String), ...tail].join("  "));
   }
   return lines.join("\n");
 }
@@ -145,12 +153,19 @@ export function buildMarkdownReport(opts: {
   const entries = survivorEntries(opts.root, opts.rows);
   const clusters = formatSurvivorClusters(entries);
   const recheckIds = recheckIdsOf(opts.rows);
-  const lines = [opts.heading, "", "| file | killed | survived | unread | score |", "| --- | --- | --- | --- | --- |"];
+  const lines = [
+    opts.heading,
+    "",
+    "| file | killed | survived | unread | score | suites |",
+    "| --- | --- | --- | --- | --- | --- |",
+  ];
   for (const [file, group] of Map.groupBy(opts.rows, (row) => row.file)) {
     const k = group.filter((row) => verdictOf(row.killed) === "killed").length;
     const s = group.filter((row) => verdictOf(row.killed) === "survived").length;
     const u = group.filter((row) => verdictOf(row.killed) === "unread").length;
-    lines.push(`| \`${file}\` | ${String(k)} | ${String(s)} | ${String(u)} | ${formatScore(k, s)} |`);
+    lines.push(
+      `| \`${file}\` | ${String(k)} | ${String(s)} | ${String(u)} | ${formatScore(k, s)} | ${suitesInGroup(group)} |`,
+    );
   }
   const killed = opts.rows.filter((row) => verdictOf(row.killed) === "killed").length;
   const survived = opts.rows.filter((row) => verdictOf(row.killed) === "survived").length;

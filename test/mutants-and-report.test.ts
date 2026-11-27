@@ -27,6 +27,7 @@ describe("mutantsFromSource", () => {
       "  console.log(a + b, ok === true);",
       "  const msg = `sum=${a + b}`;",
       "  if (!ok && a < b) return a + 1;",
+      "  if (a === 0) throw new Error(b > 1 ? 'many' : 'one');",
       "  return a >= b ? 10 : 20;",
       "}",
       "export const obj = { 1: true };",
@@ -37,10 +38,16 @@ describe("mutantsFromSource", () => {
 
     // Inert lines: import (1), type (2), interface (3), console.log (5), template literal (6)
     expect(mutants.every((m) => ![1, 2, 3, 5, 6].includes(m.line))).toBe(true);
+    // On line 8: `if (a === 0)` guard IS mutated, while `new Error(...)` message ternary is arid
+    const line8Labels = mutants.filter((m) => m.line === 8).map((m) => m.label);
+    expect(line8Labels).toContain("delete if");
+    expect(line8Labels).toContain("=== -> !==");
+    expect(line8Labels).not.toContain("> -> >=");
+    expect(line8Labels).not.toContain("swap ?:");
     // Numeric property name `1` in `{ 1: true }` must not be mutated
-    expect(mutants.some((m) => m.line === 10 && m.label === "1 -> 2")).toBe(false);
+    expect(mutants.some((m) => m.line === 11 && m.label === "1 -> 2")).toBe(false);
     // Boolean value in `{ 1: true }` IS mutated
-    expect(mutants.some((m) => m.line === 10 && m.label === "true -> false")).toBe(true);
+    expect(mutants.some((m) => m.line === 11 && m.label === "true -> false")).toBe(true);
 
     expect(labels).toContain("delete if");
     expect(labels).toContain("drop !");
@@ -118,13 +125,14 @@ describe("verdictOf and reporting", () => {
       expect(readFileSync(idsPath, "utf8").trim().split("\n")).toEqual(ids);
 
       const table = formatReportTable(rows);
-      expect(table).toContain("file  killed  survived  unread");
-      expect(table).toContain("a.ts  1  3  1");
+      expect(table).toContain("file  killed  survived  unread  score  suites");
+      expect(table).toContain("a.ts  1  3  1  25.0%  u, v");
 
       const md = buildMarkdownReport({ root: dir, heading: "# Test", rows, idsFile: idsPath });
       expect(md.killed).toBe(1);
       expect(md.survived).toBe(3);
       expect(md.unread).toBe(1);
+      expect(md.markdown).toContain("| `a.ts` | 1 | 3 | 1 | 25.0% | u, v |");
       expect(md.markdown).toContain(idsPath);
     } finally {
       rmSync(dir, { recursive: true, force: true });
