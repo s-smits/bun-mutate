@@ -282,6 +282,35 @@ export async function runMutationSpecs(opts: RunOptions): Promise<RunSummary> {
   const durations = new Map<string, number>();
   let schemataEncoded = 0;
 
+  const finishPool = async (afterSchema: readonly PendingItem[]): Promise<RunSummary> => {
+    if (afterSchema.length === 0) {
+      return { run: rows.length, heldBefore, unrun: 0, refused: null, staleWarnings, schemataEncoded, rows };
+    }
+    return await runIsolatedPool({
+      opts,
+      afterSchema,
+      originals,
+      allSuites,
+      helperFiles,
+      priorById,
+      localQualified,
+      durations,
+      ensureWorkers,
+      concurrency,
+      seconds,
+      deadline,
+      prune,
+      mode,
+      stopAtKill,
+      heldBefore,
+      staleWarnings,
+      schemataEncoded,
+      rows,
+      record,
+      progress,
+    });
+  };
+
   try {
     if (enableSchemata && Date.now() < deadline) {
       const schemataStart = Date.now();
@@ -323,86 +352,16 @@ export async function runMutationSpecs(opts: RunOptions): Promise<RunSummary> {
           );
         }
       }
-      const settledBeforeSplit = rows.length;
-      const afterSchemata = splitAfterSchema(todo, priorById, mode, record);
-      const settledInSchemata = rows.length - settledBeforeSplit;
       if (schemataEncoded > 0 && durations.size > 0) {
         const sec = ((Date.now() - schemataStart) / 1000).toFixed(1);
+        const after = splitAfterSchema(todo, priorById, mode, record);
         progress(
-          `schemata: ${String(settledInSchemata)}/${String(todo.length)} settled in ${sec}s (${String(afterSchemata.length)} remaining)`,
+          `schemata: ${String(rows.length)}/${String(todo.length)} settled in ${sec}s (${String(after.length)} remaining)`,
         );
+        return await finishPool(after);
       }
-      if (afterSchemata.length === 0) {
-        return {
-          run: rows.length,
-          heldBefore,
-          unrun: 0,
-          refused: null,
-          staleWarnings,
-          schemataEncoded,
-          rows,
-        };
-      }
-      return await runIsolatedPool({
-        opts,
-        afterSchema: afterSchemata,
-        originals,
-        allSuites,
-        helperFiles,
-        priorById,
-        localQualified,
-        durations,
-        ensureWorkers,
-        concurrency,
-        seconds,
-        deadline,
-        prune,
-        mode,
-        stopAtKill,
-        heldBefore,
-        staleWarnings,
-        schemataEncoded,
-        rows,
-        record,
-        progress,
-      });
     }
-
-    const afterSchema = splitAfterSchema(todo, priorById, mode, record);
-    if (afterSchema.length === 0) {
-      return {
-        run: rows.length,
-        heldBefore,
-        unrun: 0,
-        refused: null,
-        staleWarnings,
-        schemataEncoded,
-        rows,
-      };
-    }
-    return await runIsolatedPool({
-      opts,
-      afterSchema,
-      originals,
-      allSuites,
-      helperFiles,
-      priorById,
-      localQualified,
-      durations,
-      ensureWorkers,
-      concurrency,
-      seconds,
-      deadline,
-      prune,
-      mode,
-      stopAtKill,
-      heldBefore,
-      staleWarnings,
-      schemataEncoded,
-      rows,
-      record,
-      progress,
-    });
+    return await finishPool(splitAfterSchema(todo, priorById, mode, record));
   } finally {
     if (ephemeralRoot !== null) rmSync(ephemeralRoot, { recursive: true, force: true });
   }

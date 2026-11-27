@@ -120,9 +120,11 @@ async function spawnTest(
   seconds: number,
   localConc: number,
   activeProcs?: Set<KillableProc>,
+  covDir?: string,
 ) {
   // Keep Bun's per-test timeout above the external SIGKILL watchdog so infinite loops surface as `unread` (`null`).
   const bunTimeoutMs = Math.max(60_000, Math.ceil(seconds * 1000) + 5_000);
+  const covArgs = covDir === undefined ? [] : ["--coverage", "--coverage-reporter=lcov", `--coverage-dir=${covDir}`];
   const run = Bun.spawn(
     [
       process.execPath,
@@ -130,14 +132,10 @@ async function spawnTest(
       "--bail",
       `--max-concurrency=${String(localConc)}`,
       `--timeout=${String(bunTimeoutMs)}`,
+      ...covArgs,
       ...paths.map(explicitPath),
     ],
-    {
-      cwd,
-      stdout: "pipe",
-      stderr: "pipe",
-      detached: true,
-    },
+    { cwd, stdout: "pipe", stderr: "pipe", detached: true },
   );
   return drainProcess(run, seconds, activeProcs);
 }
@@ -148,11 +146,15 @@ async function verdict(
   seconds: number,
   localConc: number,
   activeProcs?: Set<KillableProc>,
+  covDir?: string,
 ): Promise<boolean | null> {
-  const { said, code, signalled } = await spawnTest(cwd, paths, seconds, localConc, activeProcs);
+  const { said, code, signalled } = await spawnTest(cwd, paths, seconds, localConc, activeProcs, covDir);
   if (signalled) return null;
   return VERDICT_RE.test(said) ? code !== 0 : null;
 }
+
+const refusalFor = (name: string, said: boolean | null): string =>
+  `baseline suite "${name}" did not pass unmutated (${said === true ? "failed" : "no verdict"})`;
 
 export type KillOutcome =
   | { readonly kind: "ok"; readonly killed: VerdictMap }
@@ -378,51 +380,19 @@ export async function qualifySuiteWithPruning(
     const t0 = Date.now();
     const said = await verdict(worker.clone, paths, opts.seconds, opts.localConc);
     const durationMs = Math.max(1, Date.now() - t0);
-    if (said === false) return { refused: null, durationMs };
-    return {
-      refused: `baseline suite "${name}" did not pass unmutated (${said === true ? "failed" : "no verdict"})`,
-      durationMs,
-    };
+    return { refused: said === false ? null : refusalFor(name, said), durationMs };
   }
   if (!sub) {
     const outDir = mkdtempSync(join(tmpdir(), "bm-lcov-"));
     try {
       const t0 = Date.now();
-      const bunTimeoutMs = Math.max(60_000, Math.ceil(opts.seconds * 1000) + 5_000);
-      const run = Bun.spawn(
-        [
-          process.execPath,
-          "test",
-          "--bail",
-          `--max-concurrency=${String(opts.localConc)}`,
-          `--timeout=${String(bunTimeoutMs)}`,
-          "--coverage",
-          "--coverage-reporter=lcov",
-          `--coverage-dir=${outDir}`,
-          ...paths.map(explicitPath),
-        ],
-        { cwd: worker.clone, stdout: "pipe", stderr: "pipe", detached: true },
-      );
-      const { said, code, signalled } = await drainProcess(run, opts.seconds);
+      const said = await verdict(worker.clone, paths, opts.seconds, opts.localConc, undefined, outDir);
       const durationMs = Math.max(1, Date.now() - t0);
-      const ok = !signalled && code === 0 && VERDICT_RE.test(said);
-      if (!ok) {
-        const reason = !signalled && VERDICT_RE.test(said) && code !== 0 ? "failed" : "no verdict";
-        return {
-          refused: `baseline suite "${name}" did not pass unmutated (${reason})`,
-          durationMs,
-        };
-      }
+      if (said !== false) return { refused: refusalFor(name, said), durationMs };
       const lcovFile = join(outDir, "lcov.info");
-      if (existsSync(lcovFile)) {
-        const parsed = parseCoverage(
-          worker.clone,
-          readFileSync(lcovFile, "utf8"),
-          new Set(opts.files.map(toPosix)),
-        );
-        return { refused: null, durationMs, uncovered: parsed.uncovered, covered: parsed.covered };
-      }
-      return { refused: null, durationMs };
+      if (!existsSync(lcovFile)) return { refused: null, durationMs };
+      const parsed = parseCoverage(worker.clone, readFileSync(lcovFile, "utf8"), new Set(opts.files.map(toPosix)));
+      return { refused: null, durationMs, uncovered: parsed.uncovered, covered: parsed.covered };
     } finally {
       rmSync(outDir, { recursive: true, force: true });
     }
@@ -725,28 +695,9 @@ export async function measureCoverage(
     const outDir = join(dir, String(seq));
     mkdirSync(outDir, { recursive: true });
     const started = Date.now();
-    const covArgs = sub ? [] : ["--coverage", "--coverage-reporter=lcov", `--coverage-dir=${outDir}`];
-    const bunTimeoutMs = Math.max(60_000, Math.ceil(opts.seconds * 1000) + 5_000);
-    const run = Bun.spawn(
-      [
-        process.execPath,
-        "test",
-        "--bail",
-        `--max-concurrency=${String(maxConc)}`,
-        `--timeout=${String(bunTimeoutMs)}`,
-        ...covArgs,
-        ...paths.map(explicitPath),
-      ],
-      {
-        cwd: root,
-        stdout: "pipe",
-        stderr: "pipe",
-        detached: true,
-      },
-    );
-    const { said, code, signalled } = await drainProcess(run, opts.seconds);
+    const said = await verdict(root, paths, opts.seconds, maxConc, undefined, sub ? undefined : outDir);
     const ms = Math.max(1, Date.now() - started);
-    if (signalled || code !== 0 || !VERDICT_RE.test(said)) return;
+    if (said !== false) return;
     passed.add(name);
     durations.set(name, ms);
     const lcovFile = join(outDir, "lcov.info");
