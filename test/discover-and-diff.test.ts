@@ -142,6 +142,38 @@ describe("automatic repo discovery and path aliases", () => {
       rmSync(dir, { recursive: true, force: true });
     }
   });
+
+  it("orders pure unit suites ahead of subprocess integration suites when no timings exist", () => {
+    const dir = mkdtempSync(join(tmpdir(), "bm-order-"));
+    try {
+      mkdirSync(join(dir, "src"), { recursive: true });
+      mkdirSync(join(dir, "test"), { recursive: true });
+      writeFileSync(join(dir, "src", "core.ts"), "export const add = (a: number, b: number) => a + b;\n");
+      // Tiny subprocess suite (fewer bytes!)
+      writeFileSync(
+        join(dir, "test", "a-integration.test.ts"),
+        'import { add } from "../src/core.ts";\nBun.spawnSync(["echo", String(add(1, 2))]);\n',
+      );
+      // Larger pure unit suite (more bytes, but pure in-process!)
+      writeFileSync(
+        join(dir, "test", "z-unit.test.ts"),
+        [
+          'import { describe, expect, it } from "bun:test";',
+          'import { add } from "../src/core.ts";',
+          'describe("add exhaustive", () => {',
+          '  it("checks many cases cleanly without subprocesses or filesystem writes", () => {',
+          "    expect(add(1, 2)).toBe(3);",
+          "    expect(add(10, 20)).toBe(30);",
+          "  });",
+          "});",
+        ].join("\n") + "\n",
+      );
+      const index = buildTestIndex(dir, { depth: 1 });
+      expect(index.suitesFor("src/core.ts")).toEqual(["test/z-unit.test.ts", "test/a-integration.test.ts"]);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
 });
 
 describe("git diff parsing and zero-flag diff-hunk mode", () => {

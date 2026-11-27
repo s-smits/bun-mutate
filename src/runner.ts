@@ -1,7 +1,8 @@
 import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { availableParallelism, tmpdir } from "node:os";
 import { dirname, join } from "node:path";
-import { cloneTree, linkModules, type LocalWorker, measureCoverage } from "./exec.ts";
+import { collectSuiteHelperDeps, type TestIndex } from "./discover.ts";
+import { cloneTree, linkModules, type LocalWorker, measureCoverage, spawnsSubprocess } from "./exec.ts";
 import { gitMaybe } from "./git.ts";
 import { mutantsOf } from "./mutants.ts";
 import { type PoolTask, runLocalPool } from "./pool.ts";
@@ -39,7 +40,9 @@ export interface RunOptions {
   readonly concurrency?: number;
   readonly timeoutSeconds?: number;
   readonly deadlineMs?: number;
+  readonly testIndex?: TestIndex;
   readonly warn?: (message: string) => void;
+  readonly progress?: (message: string) => void;
 }
 
 export interface RunSummary {
@@ -171,6 +174,7 @@ export async function runMutationSpecs(opts: RunOptions): Promise<RunSummary> {
   const deadline = opts.deadlineMs ?? Number.POSITIVE_INFINITY;
   const concurrency = Math.max(1, Math.min(16, opts.concurrency ?? Math.min(8, availableParallelism())));
   const warn = opts.warn ?? ((msg: string) => console.error(msg));
+  const progress = opts.progress ?? (() => {});
 
   const { originals, allSuites, todo, heldBefore, staleWarnings } = collectTargets(
     opts.root,
@@ -180,6 +184,11 @@ export async function runMutationSpecs(opts: RunOptions): Promise<RunSummary> {
   if (todo.length === 0) {
     return { run: 0, heldBefore, unrun: 0, refused: null, staleWarnings, schemataEncoded: 0, rows: [] };
   }
+
+  const helperFiles = collectSuiteHelperDeps(opts.root, allSuites, opts.testIndex);
+  progress(
+    `mutating ${String(todo.length)} mutant(s) across ${String(originals.size)} file(s) (${String(allSuites.size)} suite(s))`,
+  );
 
   const rows: ResultRow[] = [];
   const madeDirs = new Set<string>();
@@ -207,29 +216,70 @@ export async function runMutationSpecs(opts: RunOptions): Promise<RunSummary> {
   let schemataEncoded = 0;
 
   if (enableSchemata && Date.now() < deadline) {
+    const stage1Start = Date.now();
     const byFile = Map.groupBy(todo, (item) => item.mutant.file);
-    const results = await Promise.all(
-      [...byFile.entries()].map(([file, items]) => {
-        const suiteOrder = [...new Set(items.flatMap((item) => item.suites))];
-        return screenFileWithSchemata({
-          root: opts.root,
-          file,
-          source: originals.get(file) ?? "",
-          mutants: items.map((item) => item.mutant),
-          suites: allSuites,
-          suiteOrder,
-          capSeconds: seconds,
-          stopAtKill,
-          concurrency,
-        });
-      }),
-    );
-    for (const res of results) {
+    for (const [file, items] of byFile) {
+      if (Date.now() >= deadline) break;
+      const suiteOrder = [...new Set(items.flatMap((item) => item.suites))];
+      const res = await screenFileWithSchemata({
+        root: opts.root,
+        file,
+        source: originals.get(file) ?? "",
+        mutants: items.map((item) => item.mutant),
+        suites: allSuites,
+        suiteOrder,
+        helperFiles,
+        capSeconds: seconds,
+        stopAtKill,
+        concurrency,
+      });
       schemataEncoded += res.encodedCount;
       for (const name of res.qualifiedSuites) localQualified.add(name);
       for (const [name, ms] of res.durations) durations.set(name, ms);
       for (const [id, row] of res.verdicts) priorById.set(id, row);
     }
+    const settledBeforeSplit = rows.length;
+    const afterStage1 = splitAfterSchema(todo, priorById, mode, record);
+    const settledInStage1 = rows.length - settledBeforeSplit;
+    if (schemataEncoded > 0 && localQualified.size > 0) {
+      const sec = ((Date.now() - stage1Start) / 1000).toFixed(1);
+      progress(
+        `stage 1 (schemata): ${String(settledInStage1)}/${String(todo.length)} settled in ${sec}s (${String(afterStage1.length)} remaining)`,
+      );
+    }
+    if (afterStage1.length === 0) {
+      return {
+        run: rows.length,
+        heldBefore,
+        unrun: 0,
+        refused: null,
+        staleWarnings,
+        schemataEncoded,
+        rows,
+      };
+    }
+    return await runStage2({
+      opts,
+      afterSchema: afterStage1,
+      originals,
+      allSuites,
+      helperFiles,
+      priorById,
+      localQualified,
+      durations,
+      concurrency,
+      seconds,
+      deadline,
+      prune,
+      mode,
+      stopAtKill,
+      heldBefore,
+      staleWarnings,
+      schemataEncoded,
+      rows,
+      record,
+      progress,
+    });
   }
 
   const afterSchema = splitAfterSchema(todo, priorById, mode, record);
@@ -244,20 +294,100 @@ export async function runMutationSpecs(opts: RunOptions): Promise<RunSummary> {
       rows,
     };
   }
+  return await runStage2({
+    opts,
+    afterSchema,
+    originals,
+    allSuites,
+    helperFiles,
+    priorById,
+    localQualified,
+    durations,
+    concurrency,
+    seconds,
+    deadline,
+    prune,
+    mode,
+    stopAtKill,
+    heldBefore,
+    staleWarnings,
+    schemataEncoded,
+    rows,
+    record,
+    progress,
+  });
+}
 
-  // Stage 2: Process-isolated pool with APFS CoW / Linux hardlink clones and subprocess-aware LCOV pruning.
-  const leadNeeded = new Set(
-    afterSchema.flatMap(({ rest }) => {
-      if (mode !== "stop-at-kill" || rest.length < 2) return rest;
-      const keep = Math.min(rest.length - 1, Math.max(1, Math.floor((rest.length * 2) / 3)));
-      return rest.slice(0, keep);
+async function runStage2(ctx: {
+  readonly opts: RunOptions;
+  readonly afterSchema: readonly PendingItem[];
+  readonly originals: ReadonlyMap<string, string>;
+  readonly allSuites: ReadonlyMap<string, readonly string[]>;
+  readonly helperFiles: ReadonlyMap<string, readonly string[]>;
+  readonly priorById: ReadonlyMap<string, Map<string, boolean | null>>;
+  readonly localQualified: Set<string>;
+  readonly durations: Map<string, number>;
+  readonly concurrency: number;
+  readonly seconds: number;
+  readonly deadline: number;
+  readonly prune: boolean;
+  readonly mode: KillMode;
+  readonly stopAtKill: boolean;
+  readonly heldBefore: number;
+  readonly staleWarnings: readonly StaleOnlyWarning[];
+  readonly schemataEncoded: number;
+  readonly rows: ResultRow[];
+  readonly record: (item: TargetItem, killed: VerdictMap) => void;
+  readonly progress: (message: string) => void;
+}): Promise<RunSummary> {
+  const {
+    opts,
+    afterSchema,
+    originals,
+    allSuites,
+    helperFiles,
+    priorById,
+    localQualified,
+    durations,
+    concurrency,
+    seconds,
+    deadline,
+    prune,
+    mode,
+    stopAtKill,
+    heldBefore,
+    staleWarnings,
+    schemataEncoded,
+    rows,
+    record,
+    progress,
+  } = ctx;
+  const cacheDir = opts.covCache ?? null;
+  const hasCache = cacheDir !== null && existsSync(cacheDir);
+  const demand = new Map<string, number>();
+  const leadSet = new Set<string>();
+  const leadNeeded = new Set<string>();
+  for (const { rest } of afterSchema) {
+    if (rest[0] !== undefined) leadSet.add(rest[0]);
+    for (const name of rest) demand.set(name, (demand.get(name) ?? 0) + 1);
+    const keep =
+      mode !== "stop-at-kill" || rest.length < 2
+        ? rest
+        : rest.slice(0, Math.min(rest.length - 1, Math.max(1, Math.floor((rest.length * 2) / 3))));
+    for (const name of keep) leadNeeded.add(name);
+  }
+  const covSuites = new Map(
+    [...allSuites.entries()].filter(([name, paths]) => {
+      if (!leadNeeded.has(name) || localQualified.has(name)) return false;
+      const count = demand.get(name) ?? 0;
+      if (count < 3 && !hasCache) return false;
+      if (spawnsSubprocess(opts.root, paths, helperFiles.get(name))) {
+        return hasCache || (count >= 5 && leadSet.has(name));
+      }
+      return true;
     }),
   );
-  const covSuites = new Map(
-    [...allSuites.entries()].filter(([name]) => leadNeeded.has(name) && !localQualified.has(name)),
-  );
-  const cacheDir = opts.covCache ?? null;
-  const runCov = prune && (afterSchema.length >= 5 || (cacheDir !== null && existsSync(cacheDir)));
+  const runCov = prune && covSuites.size > 0 && (afterSchema.length >= 5 || hasCache);
 
   const ephemeralRoot =
     opts.clonesPrefix === null || opts.clonesPrefix === undefined
@@ -291,6 +421,10 @@ export async function runMutationSpecs(opts: RunOptions): Promise<RunSummary> {
     }
   };
 
+  progress(
+    `stage 2 (isolated): ${String(afterSchema.length)} mutant(s) across ${String(slotCount)} worker(s)${runCov ? ` + ${String(covSuites.size)} coverage suite(s)` : ""}`,
+  );
+
   try {
     const [cov] = await Promise.all([
       runCov
@@ -298,6 +432,7 @@ export async function runMutationSpecs(opts: RunOptions): Promise<RunSummary> {
             seconds,
             cacheDir,
             concurrency,
+            helperFiles,
           })
         : Promise.resolve({
             uncovered: new Map<string, Map<string, Set<number>>>(),
@@ -349,6 +484,7 @@ export async function runMutationSpecs(opts: RunOptions): Promise<RunSummary> {
           record(item, finalizeRow(item.suites, priorById.get(item.mutant.id), raw, mode));
         }
       },
+      progress,
     });
     return {
       run: rows.length,

@@ -269,4 +269,65 @@ describe("Mode 2 process-isolated pool and execution invariants", () => {
       rmSync(dir, { recursive: true, force: true });
     }
   });
+
+  it("detects subprocess calls inside imported test helpers so hybrid suites are not LCOV-pruned", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "bm-helper-sub-"));
+    try {
+      mkdirSync(join(dir, "src"), { recursive: true });
+      mkdirSync(join(dir, "test", "helpers"), { recursive: true });
+      writeFileSync(
+        join(dir, "src", "hybrid.ts"),
+        [
+          "export function inProc(x: number): number { return x + 1; }",
+          "export function cliOnly(x: number): number { return x > 5 ? 1 : 0; }",
+          "if (import.meta.main) console.log(String(cliOnly(Number(Bun.argv[2]))));",
+        ].join("\n") + "\n",
+      );
+      writeFileSync(
+        join(dir, "test", "helpers", "run-cli.ts"),
+        [
+          'export function runCli(script: string, arg: string): string {',
+          '  const r = Bun.spawnSync([process.execPath, script, arg], { stdout: "pipe" });',
+          '  return new TextDecoder().decode(r.stdout).trim();',
+          "}",
+        ].join("\n") + "\n",
+      );
+      writeFileSync(
+        join(dir, "test", "hybrid.test.ts"),
+        [
+          'import { expect, it } from "bun:test";',
+          'import { join } from "node:path";',
+          'import { inProc } from "../src/hybrid.ts";',
+          'import { runCli } from "./helpers/run-cli.ts";',
+          'const target = join(import.meta.dir, "..", "src", "hybrid.ts");',
+          'it("tests in-process and via helper subprocess", () => {',
+          "  expect(inProc(2)).toBe(3);",
+          '  expect(runCli(target, "6")).toBe("1");',
+          '  expect(runCli(target, "5")).toBe("0");',
+          "});",
+        ].join("\n") + "\n",
+      );
+
+      const res = await runMutationSpecs({
+        root: dir,
+        specs: [
+          {
+            file: "src/hybrid.ts",
+            out: join(dir, "out.jsonl"),
+            suites: { hybrid: ["test/hybrid.test.ts"] },
+          },
+        ],
+        prune: true,
+        schemata: true,
+      });
+      expect(res.refused).toBeNull();
+      // The `cliOnly` line-2 mutants (`> -> >=`, `5 -> 6`, `1 -> 2`, `0 -> 1`) are ONLY executed in the child process.
+      // Because test/helpers/run-cli.ts is detected as a subprocess helper, Stage 1 skips it and Stage 2 skips LCOV pruning!
+      const cliLineMutants = res.rows.filter((r) => r.line === 2);
+      expect(cliLineMutants.length).toBeGreaterThanOrEqual(3);
+      expect(cliLineMutants.every((r) => verdictOf(r.killed) === "killed")).toBe(true);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
 });

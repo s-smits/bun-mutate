@@ -51,6 +51,7 @@ export async function runLocalPool(opts: {
   readonly seconds: number;
   readonly deadline: number;
   readonly onResult: (task: PoolTask, killed: VerdictMap) => void;
+  readonly progress?: (message: string) => void;
 }): Promise<{ readonly refused: string | null; readonly unrun: number }> {
   const pending = [...opts.tasks].toSorted((a, b) => b.weightMs - a.weightMs);
   const activeSuites = new Map(
@@ -86,6 +87,8 @@ export async function runLocalPool(opts: {
   const killStats = new Map<string, SuiteKillStat>();
   let refused: string | null = null;
   let localInFlight = 0;
+  let killedSoFar = 0;
+  let lastProgressAt = Date.now();
 
   let resolveDone: (() => void) | null = null;
   const finished = new Promise<void>((resolve) => {
@@ -97,6 +100,8 @@ export async function runLocalPool(opts: {
   const finishTask = (task: PoolTask, killed: VerdictMap) => {
     if (doneKeys.has(task.key)) return;
     doneKeys.add(task.key);
+    const wasKilled = Object.values(killed).includes(true);
+    if (wasKilled) killedSoFar += 1;
     for (const [suite, out] of Object.entries(killed)) {
       if (out !== true && out !== false) continue;
       const key = `${task.plan.mutant.file}\0${suite}`;
@@ -106,6 +111,17 @@ export async function runLocalPool(opts: {
       killStats.set(key, cur);
     }
     opts.onResult(task, killed);
+    const now = Date.now();
+    if (
+      opts.progress !== undefined &&
+      doneKeys.size < opts.tasks.length &&
+      (doneKeys.size % 25 === 0 || now - lastProgressAt >= 10_000)
+    ) {
+      lastProgressAt = now;
+      opts.progress(
+        `stage 2: ${String(doneKeys.size)}/${String(opts.tasks.length)} done (${String(killedSoFar)} killed)`,
+      );
+    }
     if (doneKeys.size >= opts.tasks.length) resolveDone?.();
   };
 

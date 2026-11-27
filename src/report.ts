@@ -117,6 +117,16 @@ export function writeSurvivorsFile(path: string, ids: readonly string[]): boolea
   return true;
 }
 
+export function mutationScore(killed: number, survived: number): number | null {
+  const scored = killed + survived;
+  return scored === 0 ? null : (killed / scored) * 100;
+}
+
+export function formatScore(killed: number, survived: number): string {
+  const pct = mutationScore(killed, survived);
+  return pct === null ? "n/a" : `${pct.toFixed(1)}%`;
+}
+
 export function buildMarkdownReport(opts: {
   readonly root: string;
   readonly heading: string;
@@ -128,20 +138,24 @@ export function buildMarkdownReport(opts: {
   readonly killed: number;
   readonly survived: number;
   readonly unread: number;
+  readonly score: number | null;
   readonly clusters: readonly string[];
   readonly recheckIds: readonly string[];
 } {
   const entries = survivorEntries(opts.root, opts.rows);
   const clusters = formatSurvivorClusters(entries);
   const recheckIds = recheckIdsOf(opts.rows);
-  const lines = [opts.heading, "", "| file | killed | survived | unread |", "| --- | --- | --- | --- |"];
+  const lines = [opts.heading, "", "| file | killed | survived | unread | score |", "| --- | --- | --- | --- | --- |"];
   for (const [file, group] of Map.groupBy(opts.rows, (row) => row.file)) {
-    const count = (kind: VerdictKind) => String(group.filter((row) => verdictOf(row.killed) === kind).length);
-    lines.push(`| \`${file}\` | ${count("killed")} | ${count("survived")} | ${count("unread")} |`);
+    const k = group.filter((row) => verdictOf(row.killed) === "killed").length;
+    const s = group.filter((row) => verdictOf(row.killed) === "survived").length;
+    const u = group.filter((row) => verdictOf(row.killed) === "unread").length;
+    lines.push(`| \`${file}\` | ${String(k)} | ${String(s)} | ${String(u)} | ${formatScore(k, s)} |`);
   }
   const killed = opts.rows.filter((row) => verdictOf(row.killed) === "killed").length;
   const survived = opts.rows.filter((row) => verdictOf(row.killed) === "survived").length;
   const unread = opts.rows.filter((row) => verdictOf(row.killed) === "unread").length;
+  const score = mutationScore(killed, survived);
   lines.push("");
   if (opts.untested !== undefined) {
     for (const [file, count] of opts.untested) {
@@ -149,7 +163,7 @@ export function buildMarkdownReport(opts: {
     }
   }
   lines.push(
-    `Totals: ${String(opts.rows.length)} mutants (${String(killed)} killed, ${String(survived)} survived across ${String(clusters.length)} line(s), ${String(unread)} unread)`,
+    `Totals: ${String(opts.rows.length)} mutants (${String(killed)} killed, ${String(survived)} survived across ${String(clusters.length)} line(s), ${String(unread)} unread, score ${formatScore(killed, survived)})`,
   );
   if (opts.idsFile !== null && opts.idsFile !== undefined && recheckIds.length > 0) {
     lines.push(`Recheck IDs (\`bun-mutate run --only\`): \`${opts.idsFile}\``);
@@ -160,6 +174,7 @@ export function buildMarkdownReport(opts: {
     killed,
     survived,
     unread,
+    score,
     clusters,
     recheckIds,
   };

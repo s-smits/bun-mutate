@@ -6,20 +6,20 @@ import {
   readdirSync,
   readFileSync,
   rmSync,
+  statSync,
   symlinkSync,
   writeFileSync,
 } from "node:fs";
 import { availableParallelism, tmpdir } from "node:os";
 import { isAbsolute, join, relative, resolve } from "node:path";
-import { toPosix } from "./discover.ts";
+import { SUBPROCESS_RE, toPosix } from "./discover.ts";
 import { applyMutant } from "./mutants.ts";
 import { drainProcess, type KillableProc } from "./proc.ts";
 import type { BatchPlan, VerdictMap } from "./types.ts";
 
 const VERDICT_RE = /\n *\d+ (pass|fail)|\nBailed out after \d+ failures?/;
 
-const SUBPROCESS_RE =
-  /\b(?:Bun\.spawn|Bun\.spawnSync|spawnSync|execSync|execFileSync|child_process)\b|node:child_process/u;
+const CLONE_SKIP_DIRS = new Set(["node_modules", ".bun-mutate", ".cache", ".turbo", ".next", "coverage"]);
 
 export interface LocalWorker {
   readonly id: number;
@@ -322,7 +322,7 @@ export async function cloneTree(root: string, dest: string): Promise<void> {
     ? absDest.slice(absRoot.length + 1).split("/")[0]
     : null;
   const entries = readdirSync(absRoot).filter(
-    (name) => name !== "node_modules" && name !== ".bun-mutate" && name !== skipInsideRoot,
+    (name) => !CLONE_SKIP_DIRS.has(name) && name !== skipInsideRoot,
   );
   if (entries.length > 0 && (process.platform === "darwin" || process.platform === "linux")) {
     const flag = process.platform === "darwin" ? "-cRp" : "-al";
@@ -345,13 +345,34 @@ export function linkModules(root: string, clone: string): void {
   if (existsSync(rootModules) && !existsSync(cloneModules)) {
     symlinkSync(rootModules, cloneModules);
   }
+  for (const wsDir of ["packages", "apps"]) {
+    const absWs = join(root, wsDir);
+    if (!existsSync(absWs)) continue;
+    try {
+      for (const entry of readdirSync(absWs, { withFileTypes: true })) {
+        if (!entry.isDirectory()) continue;
+        const pkgMods = join(absWs, entry.name, "node_modules");
+        const clonePkgMods = join(clone, wsDir, entry.name, "node_modules");
+        if (existsSync(pkgMods) && !existsSync(clonePkgMods)) {
+          symlinkSync(pkgMods, clonePkgMods);
+        }
+      }
+    } catch {
+      // Ignore unreadable workspace directories
+    }
+  }
 }
 
-export function spawnsSubprocess(root: string, paths: readonly string[]): boolean {
-  return paths.some((path) => {
+export function spawnsSubprocess(
+  root: string,
+  paths: readonly string[],
+  helperFiles: readonly string[] = [],
+): boolean {
+  for (const path of [...paths, ...helperFiles]) {
     const full = join(root, path);
-    return existsSync(full) && SUBPROCESS_RE.test(readFileSync(full, "utf8"));
-  });
+    if (existsSync(full) && SUBPROCESS_RE.test(readFileSync(full, "utf8"))) return true;
+  }
+  return false;
 }
 
 function parseCoverage(root: string, lcov: string, files: ReadonlySet<string>) {
@@ -381,6 +402,41 @@ function parseCoverage(root: string, lcov: string, files: ReadonlySet<string>) {
 
 const cacheKey = (name: string) => name.replaceAll(/[^A-Za-z0-9._-]/gu, "_");
 
+function isCacheFresh(cachePath: string, root: string, deps: readonly string[]): boolean {
+  if (!existsSync(cachePath)) return false;
+  let cacheMtime: number;
+  try {
+    cacheMtime = statSync(cachePath).mtimeMs;
+  } catch {
+    return false;
+  }
+  for (const dep of deps) {
+    const full = join(root, dep);
+    if (!existsSync(full)) continue;
+    try {
+      if (statSync(full).mtimeMs > cacheMtime) return false;
+    } catch {
+      return false;
+    }
+  }
+  return true;
+}
+
+export function loadCachedDurations(cacheDir: string | null): Map<string, number> {
+  const out = new Map<string, number>();
+  if (cacheDir === null || !existsSync(cacheDir)) return out;
+  try {
+    for (const file of readdirSync(cacheDir)) {
+      if (!file.endsWith(".ok")) continue;
+      const ms = Number(readFileSync(join(cacheDir, file), "utf8").trim());
+      if (Number.isFinite(ms) && ms > 0) out.set(file.slice(0, -3), ms);
+    }
+  } catch {
+    // Ignore unreadable cache directory
+  }
+  return out;
+}
+
 export interface CoverageResult {
   readonly uncovered: Map<string, Map<string, Set<number>>>;
   readonly covered: Map<string, Map<string, number>>;
@@ -392,7 +448,12 @@ export async function measureCoverage(
   root: string,
   suites: ReadonlyMap<string, readonly string[]>,
   files: readonly string[],
-  opts: { readonly seconds: number; readonly cacheDir: string | null; readonly concurrency?: number },
+  opts: {
+    readonly seconds: number;
+    readonly cacheDir: string | null;
+    readonly concurrency?: number;
+    readonly helperFiles?: ReadonlyMap<string, readonly string[]>;
+  },
 ): Promise<CoverageResult> {
   const uncovered = new Map<string, Map<string, Set<number>>>();
   const covered = new Map<string, Map<string, number>>();
@@ -409,13 +470,18 @@ export async function measureCoverage(
   let seq = 0;
   const runOne = async ([name, paths]: readonly [string, readonly string[]]) => {
     const key = cacheKey(name);
-    const sub = spawnsSubprocess(root, paths);
-    if (cache !== null && existsSync(join(cache, `${key}.ok`))) {
-      const ms = Number(readFileSync(join(cache, `${key}.ok`), "utf8").trim());
+    const helpers = opts.helperFiles?.get(name) ?? [];
+    const sub = spawnsSubprocess(root, paths, helpers);
+    const suiteDeps = [...paths, ...helpers];
+    const okPath = cache !== null ? join(cache, `${key}.ok`) : null;
+    const lcovPath = cache !== null ? join(cache, `${key}.lcov`) : null;
+    const okFresh = okPath !== null && isCacheFresh(okPath, root, suiteDeps);
+    const lcovFresh = lcovPath !== null && isCacheFresh(lcovPath, root, [...suiteDeps, ...files]);
+    if (okFresh && (sub || lcovFresh)) {
+      const ms = Number(readFileSync(okPath, "utf8").trim());
       passed.add(name);
       durations.set(name, Number.isFinite(ms) && ms > 0 ? ms : 500);
-      const lcovPath = join(cache, `${key}.lcov`);
-      if (!sub && existsSync(lcovPath)) {
+      if (!sub && lcovPath !== null && existsSync(lcovPath)) {
         const parsed = parseCoverage(root, readFileSync(lcovPath, "utf8"), fileSet);
         uncovered.set(name, parsed.uncovered);
         covered.set(name, parsed.covered);

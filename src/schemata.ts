@@ -2,12 +2,10 @@ import { existsSync, mkdirSync, readFileSync, realpathSync, rmSync, writeFileSyn
 import { availableParallelism, tmpdir } from "node:os";
 import { join } from "node:path";
 import * as ts from "typescript";
+import { IMPURE_SUITE_RE } from "./discover.ts";
 import { isPropertyNameNode, scriptKindFor } from "./mutants.ts";
 import { killProcessGroup, streamLines } from "./proc.ts";
 import type { Mutant } from "./types.ts";
-
-const IMPURE_SUITE_RE =
-  /\b(?:writeFileSync|mkdtempSync|rmSync|mkdirSync|appendFileSync|renameSync|copyFileSync|cpSync|symlinkSync|chmodSync|Bun\.spawn|Bun\.spawnSync|spawnSync|execSync|execFileSync|child_process|mock\.module|spyOn|setDefaultTimeout|beforeAll|afterAll|process\.env|Bun\.env|fetch|createServer|Bun\.serve)\b|\.(?:each|only|skip|todo)\b/u;
 
 const BUN_TEST_IMPORT_RE = /import\s+\{[^}]+\}\s+from\s+["']bun:test["']/u;
 
@@ -57,14 +55,23 @@ function __bmB(k: number, op: number, a: unknown, b: unknown): unknown {
 }
 `;
 
-export function isSchemataSuite(root: string, paths: readonly string[]): boolean {
+export function isSchemataSuite(
+  root: string,
+  paths: readonly string[],
+  helperFiles: readonly string[] = [],
+): boolean {
   if (paths.length !== 1) return false;
   const only = paths[0];
   if (only === undefined) return false;
   const full = join(root, only);
   if (!existsSync(full)) return false;
   const text = readFileSync(full, "utf8");
-  return BUN_TEST_IMPORT_RE.test(text) && !IMPURE_SUITE_RE.test(text);
+  if (!BUN_TEST_IMPORT_RE.test(text) || IMPURE_SUITE_RE.test(text)) return false;
+  for (const dep of helperFiles) {
+    const depFull = join(root, dep);
+    if (existsSync(depFull) && IMPURE_SUITE_RE.test(readFileSync(depFull, "utf8"))) return false;
+  }
+  return true;
 }
 
 function isFunctionNode(node: ts.Node): boolean {
@@ -342,7 +349,11 @@ plugin({
       contents: readFileSync(path, "utf8").replace(
         /import\\s+\\{([^}]+)\\}\\s+from\\s+["']bun:test["'];?/g,
         (_: string, names: string) =>
-          "const {" + names.replaceAll(/\\bas\\b/g, ":") + "} = (globalThis as any).__BM_TEST;",
+          "const {" +
+          names
+            .replaceAll(/\\btype\\s+[A-Za-z0-9_$]+(?:\\s+as\\s+[A-Za-z0-9_$]+)?\\s*,?/g, "")
+            .replaceAll(/\\bas\\b/g, ":") +
+          "} = (globalThis as any).__BM_TEST;",
       ),
       loader: cfg.suiteLoader,
     }));
@@ -584,6 +595,7 @@ export interface SchemataResult {
   readonly qualifiedSuites: Set<string>;
   readonly durations: Map<string, number>;
   readonly encodedCount: number;
+  readonly timedOutCount: number;
 }
 
 export async function screenFileWithSchemata(opts: {
@@ -593,6 +605,7 @@ export async function screenFileWithSchemata(opts: {
   readonly mutants: readonly Mutant[];
   readonly suites: ReadonlyMap<string, readonly string[]>;
   readonly suiteOrder: readonly string[];
+  readonly helperFiles?: ReadonlyMap<string, readonly string[]>;
   readonly capSeconds: number;
   readonly stopAtKill: boolean;
   readonly concurrency?: number;
@@ -600,13 +613,16 @@ export async function screenFileWithSchemata(opts: {
   const verdicts = new Map<string, Map<string, boolean | null>>();
   const qualifiedSuites = new Set<string>();
   const durations = new Map<string, number>();
-  const eligible = opts.suiteOrder.filter((name) => isSchemataSuite(opts.root, opts.suites.get(name) ?? []));
+  let timedOutCount = 0;
+  const eligible = opts.suiteOrder.filter((name) =>
+    isSchemataSuite(opts.root, opts.suites.get(name) ?? [], opts.helperFiles?.get(name) ?? []),
+  );
   if (eligible.length === 0 || opts.mutants.length === 0) {
-    return { verdicts, qualifiedSuites, durations, encodedCount: 0 };
+    return { verdicts, qualifiedSuites, durations, encodedCount: 0, timedOutCount: 0 };
   }
   const built = buildSchemaSource(opts.file, opts.source, opts.mutants);
   if (built.source === null || built.encoded.size === 0) {
-    return { verdicts, qualifiedSuites, durations, encodedCount: 0 };
+    return { verdicts, qualifiedSuites, durations, encodedCount: 0, timedOutCount: 0 };
   }
   const tmpDir = join(
     tmpdir(),
@@ -645,12 +661,13 @@ export async function screenFileWithSchemata(opts: {
         (a, b) => b.coveredCount / Math.max(20, b.baselineMs) - a.coveredCount / Math.max(20, a.baselineMs),
       );
     let alive = [...built.encoded.keys()];
-    const maxWorkers = Math.max(1, Math.min(8, opts.concurrency ?? availableParallelism()));
+    const maxWorkers = Math.max(1, opts.concurrency ?? availableParallelism());
     for (const probe of probed) {
       qualifiedSuites.add(probe.suiteName);
       durations.set(probe.suiteName, probe.baselineMs);
       if (alive.length === 0) continue;
-      const shardCount = alive.length >= 24 ? Math.min(maxWorkers, Math.ceil(alive.length / 24)) : 1;
+      const estimatedMs = alive.length * Math.max(20, probe.baselineMs);
+      const shardCount = Math.min(maxWorkers, alive.length, Math.max(1, Math.ceil(estimatedMs / 400)));
       const shards: number[][] = Array.from({ length: shardCount }, () => []);
       for (let i = 0; i < alive.length; i += 1) {
         const id = alive[i];
@@ -684,6 +701,11 @@ export async function screenFileWithSchemata(opts: {
           nextAlive.push(id);
           continue;
         }
+        if (found === null) {
+          // Hand timed-out or crashed Mode-1 mutants straight to Mode 2 with full isolation and timeout.
+          timedOutCount += 1;
+          continue;
+        }
         const row = verdicts.get(mutant.id) ?? new Map<string, boolean | null>();
         row.set(probe.suiteName, found);
         verdicts.set(mutant.id, row);
@@ -694,5 +716,5 @@ export async function screenFileWithSchemata(opts: {
   } finally {
     rmSync(tmpDir, { recursive: true, force: true });
   }
-  return { verdicts, qualifiedSuites, durations, encodedCount: built.encoded.size };
+  return { verdicts, qualifiedSuites, durations, encodedCount: built.encoded.size, timedOutCount };
 }

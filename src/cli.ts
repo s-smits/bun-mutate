@@ -8,11 +8,13 @@ import {
   isSourceFile,
   toPosix,
 } from "./discover.ts";
+import { loadCachedDurations } from "./exec.ts";
 import { diffChangedLines, gitMaybe, resolveDiffRef } from "./git.ts";
 import { mutantsOf } from "./mutants.ts";
 import {
   buildMarkdownReport,
   formatReportTable,
+  formatScore,
   formatSurvivorClusters,
   recheckIdsOf,
   rowsOf,
@@ -47,12 +49,13 @@ Options:
   --no-schemata            Disable Mode-1 in-process schemata (force process-isolated pool)
   --cov-cache <dir>        Cache baseline suite durations and LCOV coverage
   --clones <prefix>        Reusable directory prefix for Mode-2 clones
-  --depth <n>              Import-hop depth for automatic test selection
+  --depth <n|all>          Import-hop depth for test selection (default: 1 with transitive fallback)
   --until <ISO|HH:MM>      Stop starting new mutants after deadline
   --old <suite>            (report) Compare a baseline suite against newer suites
   --survivors              (report) Print surviving and unread mutant IDs
   --write-ids <file>       Write surviving and unread IDs for \`--only\`
   --no-fail                Exit 0 even when survivors or unread mutants remain
+  -q, --quiet              Suppress progress lines on stderr
   -h, --help               Show this help
   -v, --version            Show version`;
 
@@ -89,12 +92,14 @@ const BOOL_FLAGS = new Set([
   "no-fail",
   "fail-on-survivors",
   "json",
+  "quiet",
   "help",
   "version",
 ]);
 
 const SHORT_MAP: Record<string, string> = {
   j: "jobs",
+  q: "quiet",
   h: "help",
   v: "version",
 };
@@ -322,8 +327,16 @@ async function handleRun(
     if (targetFiles.length === 0) die(`no TypeScript source files found in ${root}`);
   }
 
-  const depth = intFlag(flags, "depth") ?? (isDiff ? 1 : Number.POSITIVE_INFINITY);
-  const index = explicitSuites === null ? buildTestIndex(root, { depth }) : null;
+  const rawDepth = strFlag(flags, "depth");
+  const depth =
+    rawDepth === null
+      ? 1
+      : rawDepth === "all" || rawDepth === "infinity"
+        ? Number.POSITIVE_INFINITY
+        : intFlag(flags, "depth") ?? 1;
+  const covCache = strFlag(flags, "cov-cache");
+  const timings = loadCachedDurations(covCache);
+  const index = explicitSuites === null ? buildTestIndex(root, { depth, timings }) : null;
 
   const specs: TargetSpec[] = [];
   const untested: [string, number][] = [];
@@ -371,18 +384,23 @@ async function handleRun(
   const timeoutSeconds = intFlag(flags, "timeout") ?? 300;
   const deadlineMs = parseDeadline(strFlag(flags, "until"));
 
+  const started = Date.now();
+  const quiet = flags.has("quiet") || flags.has("json");
   const summary = await runMutationSpecs({
     root,
     specs,
     stopAtKill,
     prune,
     schemata,
-    covCache: strFlag(flags, "cov-cache"),
+    covCache,
     clonesPrefix: strFlag(flags, "clones"),
     concurrency,
     timeoutSeconds,
     deadlineMs,
+    testIndex: index ?? undefined,
+    progress: quiet ? undefined : (msg) => console.error(msg),
   });
+  const elapsedSec = ((Date.now() - started) / 1000).toFixed(1);
 
   if (summary.refused !== null) {
     console.error(summary.refused);
@@ -420,6 +438,7 @@ async function handleRun(
           killed: report.killed,
           survived: report.survived,
           unread: report.unread,
+          score: report.score,
           untested: untested.map(([file, mutants]) => ({ file, mutants })),
           out: outPath,
           idsFile: wroteIds ? idsFile : null,
@@ -430,7 +449,7 @@ async function handleRun(
     );
   } else {
     console.log(
-      `${String(summary.run)} mutants run (${String(summary.heldBefore)} held before): ${String(report.killed)} killed, ${String(report.survived)} survived, ${String(report.unread)} unread`,
+      `${String(summary.run)} mutants run in ${elapsedSec}s (${String(summary.heldBefore)} held before): ${String(report.killed)} killed, ${String(report.survived)} survived, ${String(report.unread)} unread (${formatScore(report.killed, report.survived)})`,
     );
     if (report.clusters.length > 0) {
       for (const line of report.clusters) console.log(line);

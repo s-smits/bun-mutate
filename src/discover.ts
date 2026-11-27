@@ -21,6 +21,13 @@ const SOURCE_EXT_RE = /\.(?:[cm]?ts|tsx)$/u;
 const DECLARATION_RE = /\.d\.[cm]?ts$/u;
 const TEST_FILE_RE = /(?:^|\/)(?:[^/]+\.(?:test|spec)\.[cm]?[jt]sx?)$/u;
 const TEST_DIR_SEGMENT_RE = /(?:^|\/)(?:test|tests|__tests__)(?:\/|$)/u;
+const TEST_HELPER_RE = /(?:^|\/)(?:test|tests|__tests__|helpers?|fixtures?)(?:\/|$)/u;
+
+export const SUBPROCESS_RE =
+  /\b(?:Bun\.spawn|Bun\.spawnSync|spawnSync|execSync|execFileSync|child_process)\b|node:child_process/u;
+
+export const IMPURE_SUITE_RE =
+  /\b(?:writeFileSync|mkdtempSync|rmSync|mkdirSync|appendFileSync|renameSync|copyFileSync|cpSync|symlinkSync|chmodSync|Bun\.spawn|Bun\.spawnSync|spawnSync|execSync|execFileSync|child_process|mock\.module|spyOn|setDefaultTimeout|beforeAll|afterAll|process\.env|Bun\.env|fetch|createServer|Bun\.serve)\b|\.(?:each|only|skip|todo)\b/u;
 
 const TS_TRANSPILER = new Bun.Transpiler({ loader: "ts" });
 const TSX_TRANSPILER = new Bun.Transpiler({ loader: "tsx" });
@@ -416,6 +423,7 @@ export interface TestIndex {
   readonly tests: readonly string[];
   readonly importsOf: (file: string) => readonly string[];
   readonly within: (start: string, depth: number) => Set<string>;
+  readonly helperFilesOf: (testFile: string) => readonly string[];
   readonly suitesFor: (owner: string) => string[];
 }
 
@@ -462,6 +470,35 @@ export function buildTestIndex(
     return reached;
   };
 
+  const helperCache = new Map<string, readonly string[]>();
+  const helperFilesOf = (testFile: string): readonly string[] => {
+    const norm = toPosix(testFile);
+    const cached = helperCache.get(norm);
+    if (cached !== undefined) return cached;
+    const helpers = [...within(norm, 2)].filter((file) => file !== norm && TEST_HELPER_RE.test(file));
+    helperCache.set(norm, helpers);
+    return helpers;
+  };
+
+  const tierCache = new Map<string, number>();
+  const speedTierOf = (testFile: string): number => {
+    const cached = tierCache.get(testFile);
+    if (cached !== undefined) return cached;
+    let tier = 0;
+    for (const file of [testFile, ...helperFilesOf(testFile)]) {
+      const full = join(root, file);
+      if (!existsSync(full)) continue;
+      const text = readFileSync(full, "utf8");
+      if (SUBPROCESS_RE.test(text)) {
+        tier = 2;
+        break;
+      }
+      if (IMPURE_SUITE_RE.test(text)) tier = Math.max(tier, 1);
+    }
+    tierCache.set(testFile, tier);
+    return tier;
+  };
+
   const reachAt = (limit: number) =>
     new Map(
       tests.map((test) => {
@@ -482,10 +519,12 @@ export function buildTestIndex(
       const directDiff =
         (direct.get(a)?.has(owner) === true ? 0 : 1) - (direct.get(b)?.has(owner) === true ? 0 : 1);
       if (directDiff !== 0) return directDiff;
-      const ta = timings.get(a);
-      const tb = timings.get(b);
+      const ta = timings.get(a) ?? timings.get(suiteNameForPath(a));
+      const tb = timings.get(b) ?? timings.get(suiteNameForPath(b));
       if (ta !== undefined && tb !== undefined) return ta - tb;
       if (ta !== undefined || tb !== undefined) return ta === undefined ? 1 : -1;
+      const tierDiff = speedTierOf(a) - speedTierOf(b);
+      if (tierDiff !== 0) return tierDiff;
       return statSync(join(root, a)).size - statSync(join(root, b)).size;
     };
 
@@ -508,7 +547,59 @@ export function buildTestIndex(
     return matched.toSorted(compareSuites(owner));
   };
 
-  return { tests, importsOf, within, suitesFor };
+  return { tests, importsOf, within, helperFilesOf, suitesFor };
+}
+
+export function collectSuiteHelperDeps(
+  root: string,
+  suites: ReadonlyMap<string, readonly string[]>,
+  index?: TestIndex,
+): Map<string, readonly string[]> {
+  const out = new Map<string, readonly string[]>();
+  const aliases = index === undefined ? loadRepoAliases(root) : null;
+  const localCache = new Map<string, readonly string[]>();
+  const localImports = (file: string): readonly string[] => {
+    const norm = toPosix(file);
+    const hit = localCache.get(norm);
+    if (hit !== undefined) return hit;
+    const resolved = new Set<string>();
+    if (aliases !== null) {
+      for (const spec of scanRuntimeSpecifiers(root, norm)) {
+        const target = resolveSpecifier(root, norm, spec, aliases);
+        if (target !== null) resolved.add(target);
+      }
+    }
+    const list = [...resolved];
+    localCache.set(norm, list);
+    return list;
+  };
+  const helpersFor = (testFile: string): readonly string[] => {
+    if (index !== undefined) return index.helperFilesOf(testFile);
+    const norm = toPosix(testFile);
+    const seen = new Set<string>([norm]);
+    let layer = [norm];
+    for (let hop = 0; hop < 2 && layer.length > 0; hop += 1) {
+      const next: string[] = [];
+      for (const cur of layer) {
+        for (const dep of localImports(cur)) {
+          if (!seen.has(dep)) {
+            seen.add(dep);
+            next.push(dep);
+          }
+        }
+      }
+      layer = next;
+    }
+    return [...seen].filter((file) => file !== norm && TEST_HELPER_RE.test(file));
+  };
+  for (const [name, paths] of suites) {
+    const helpers = new Set<string>();
+    for (const path of paths) {
+      for (const dep of helpersFor(path)) helpers.add(dep);
+    }
+    if (helpers.size > 0) out.set(name, [...helpers]);
+  }
+  return out;
 }
 
 export function suiteNameForPath(relPath: string): string {
