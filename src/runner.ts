@@ -159,7 +159,16 @@ function buildPoolTasks(opts: {
     if (active.length === 0) {
       opts.record(item, finalizeRow(item.suites, opts.priorById.get(item.mutant.id), {}, opts.mode));
     } else {
-      const weightMs = active.reduce((sum, name) => sum + (opts.durations.get(name) ?? UNKNOWN_SUITE_MS), 0);
+      const [first, ...restSuites] = active;
+      const tailFactor = opts.mode === "stop-at-kill" ? 0.25 : 1;
+      const weightMs =
+        first === undefined
+          ? 0
+          : (opts.durations.get(first) ?? UNKNOWN_SUITE_MS) +
+            restSuites.reduce(
+              (sum, name) => sum + (opts.durations.get(name) ?? UNKNOWN_SUITE_MS) * tailFactor,
+              0,
+            );
       tasks.push({ key: item.mutant.id, plan: { mutant: item.mutant, active }, weightMs });
     }
   }
@@ -297,7 +306,6 @@ export async function runMutationSpecs(opts: RunOptions): Promise<RunSummary> {
           concurrency,
         });
         schemataEncoded += res.encodedCount;
-        for (const name of res.qualifiedSuites) localQualified.add(name);
         for (const [name, ms] of res.durations) durations.set(name, ms);
         for (const [id, row] of res.verdicts) priorById.set(id, row);
         if (res.encodedCount > 0 && res.qualifiedSuites.size > 0) {
@@ -318,7 +326,7 @@ export async function runMutationSpecs(opts: RunOptions): Promise<RunSummary> {
       const settledBeforeSplit = rows.length;
       const afterSchemata = splitAfterSchema(todo, priorById, mode, record);
       const settledInSchemata = rows.length - settledBeforeSplit;
-      if (schemataEncoded > 0 && localQualified.size > 0) {
+      if (schemataEncoded > 0 && durations.size > 0) {
         const sec = ((Date.now() - schemataStart) / 1000).toFixed(1);
         progress(
           `schemata: ${String(settledInSchemata)}/${String(todo.length)} settled in ${sec}s (${String(afterSchemata.length)} remaining)`,

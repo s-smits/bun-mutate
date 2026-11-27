@@ -220,16 +220,19 @@ describe("Mode 1 in-process mutant schemata", () => {
     }
   });
 
-  it("aborts Mode 1 on cross-mutant state leakage via baseline self-verification", async () => {
+  it("aborts Mode 1 on cross-mutant state leakage via baseline self-verification and skips top-level mutable bindings", async () => {
     const dir = mkdtempSync(join(tmpdir(), "bm-leak-"));
     try {
-      // Mutating `count > 0` or `1` leaves `poisoned = true` so re-running unmutated fails!
+      const mutableTop = "let count = 0;\nexport const inc = (x: number) => (x > 0 ? ++count : count);\n";
+      expect(buildSchemaSource("mut.ts", mutableTop, mutantsFromSource("mut.ts", mutableTop)).source).toBeNull();
+
+      // Mutating `n === 1` leaves `state.poisoned = true` so re-running unmutated fails!
       const source = [
-        "let poisoned = false;",
+        "const state = { poisoned: false };",
         "export function step(n: number): number {",
-        "  if (poisoned) throw new Error('leaked');",
+        "  if (state.poisoned) throw new Error('leaked');",
         "  if (n === 1) return 10;",
-        "  poisoned = true;",
+        "  state.poisoned = true;",
         "  return 20;",
         "}",
       ].join("\n") + "\n";
@@ -256,7 +259,8 @@ describe("Mode 1 in-process mutant schemata", () => {
         capSeconds: 30,
         stopAtKill: true,
       });
-      // When `=== -> !==` runs, `poisoned` becomes true, causing baseline self-verification to fail -> abort!
+      // Encoded cleanly, then `=== -> !==` sets `state.poisoned = true` -> baseline self-verification aborts!
+      expect(sch.encodedCount).toBeGreaterThan(0);
       expect(sch.verdicts.size).toBe(0);
     } finally {
       rmSync(dir, { recursive: true, force: true });

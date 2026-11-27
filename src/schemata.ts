@@ -322,14 +322,23 @@ function rewriteNode(node: ts.Node, ctx: RewriteCtx, scope: "fn" | "top"): strin
   return rewriteDirectChildren(ctx.source, ctx.tree, node, recurse);
 }
 
+const hasTopLevelMutableBinding = (tree: ts.SourceFile): boolean =>
+  tree.statements.some(
+    (stmt) => ts.isVariableStatement(stmt) && (stmt.declarationList.flags & ts.NodeFlags.Const) === 0,
+  );
+
 function buildInstrumented(
   file: string,
   source: string,
   mutants: readonly Mutant[],
   preamble: string,
+  rejectMutableTopLevel: boolean,
 ): { readonly source: string | null; readonly encoded: ReadonlyMap<number, Mutant> } {
   if (mutants.length === 0) return { source: null, encoded: new Map() };
   const tree = ts.createSourceFile(file, source, ts.ScriptTarget.Latest, true, scriptKindFor(file));
+  if (rejectMutableTopLevel && hasTopLevelMutableBinding(tree)) {
+    return { source: null, encoded: new Map() };
+  }
   const { bySpan, starts } = buildMutantLookup(mutants);
   const encoded = new Map<number, Mutant>();
   const ctx: RewriteCtx = {
@@ -373,7 +382,7 @@ export function buildSchemaSource(
   source: string,
   mutants: readonly Mutant[],
 ): { readonly source: string | null; readonly encoded: ReadonlyMap<number, Mutant> } {
-  return buildInstrumented(file, source, mutants, SCHEMA_PREAMBLE);
+  return buildInstrumented(file, source, mutants, SCHEMA_PREAMBLE, true);
 }
 
 export function buildTraceSource(
@@ -382,7 +391,7 @@ export function buildTraceSource(
   mutants: readonly Mutant[],
   tracePath: string,
 ): { readonly source: string | null; readonly encoded: ReadonlyMap<number, Mutant> } {
-  return buildInstrumented(file, source, mutants, tracePreamble(tracePath));
+  return buildInstrumented(file, source, mutants, tracePreamble(tracePath), false);
 }
 
 const WORKER_HARNESS = `import {
@@ -1086,7 +1095,7 @@ export async function screenFileWithSchemata(opts: {
       );
     for (const probe of probed) {
       qualifiedSuites.add(probe.suiteName);
-      durations.set(probe.suiteName, probe.baselineMs);
+      durations.set(probe.suiteName, probe.baselineMs + 1500);
       if (alive.length === 0) continue;
       const coveredAlive: number[] = [];
       const uncoveredAlive: number[] = [];

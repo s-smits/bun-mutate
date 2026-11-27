@@ -187,24 +187,28 @@ describe("automatic repo discovery and path aliases", () => {
       mkdirSync(join(dir, "src"), { recursive: true });
       mkdirSync(join(dir, "test"), { recursive: true });
       mkdirSync(join(dir, ".huge-artifacts", "nested"), { recursive: true });
-      mkdirSync(join(dir, "data"), { recursive: true });
+      mkdirSync(join(dir, "data", "runs"), { recursive: true });
 
-      writeFileSync(join(dir, ".gitignore"), ".huge-artifacts/\ndata/\n");
+      writeFileSync(join(dir, ".gitignore"), ".huge-artifacts/\n/data/runs/\n.env\n");
       writeFileSync(join(dir, "src", "app.ts"), "export const ok = (x: number) => x > 0;\n");
       writeFileSync(
         join(dir, "test", "app.test.ts"),
         'import { expect, it } from "bun:test";\nimport { ok } from "../src/app.ts";\nit("ok", () => expect(ok(1)).toBe(true));\n',
       );
       writeFileSync(join(dir, ".huge-artifacts", "nested", "ignored.test.ts"), "export const x = 1;\n");
-      writeFileSync(join(dir, "data", "ignored.ts"), "export const y = 2;\n");
+      writeFileSync(join(dir, "data", "keep.txt"), "keep\n");
+      writeFileSync(join(dir, "data", "runs", "ignored.ts"), "export const y = 2;\n");
+      writeFileSync(join(dir, ".env"), "SECRET=1\n");
 
       expect(discoverSourceFiles(dir)).toEqual(["src/app.ts"]);
       expect(discoverTestFiles(dir)).toEqual(["test/app.test.ts"]);
 
       await cloneTree(dir, clone);
       expect(existsSync(join(clone, "src", "app.ts"))).toBe(true);
+      expect(existsSync(join(clone, "data", "keep.txt"))).toBe(true);
       expect(existsSync(join(clone, ".huge-artifacts"))).toBe(false);
-      expect(existsSync(join(clone, "data"))).toBe(false);
+      expect(existsSync(join(clone, "data", "runs"))).toBe(false);
+      expect(existsSync(join(clone, ".env"))).toBe(false);
     } finally {
       rmSync(dir, { recursive: true, force: true });
       rmSync(clone, { recursive: true, force: true });

@@ -1,5 +1,5 @@
 #!/usr/bin/env bun
-import { existsSync, mkdirSync, readFileSync, realpathSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import {
   buildSuiteMap,
@@ -410,7 +410,12 @@ async function handleRun(
   const allRows = rowsOf(outPath);
   const recheckIds = recheckIdsOf(allRows);
   const idsFile = strFlag(flags, "write-ids") ?? join(outDir, "survivors.ids.txt");
-  const wroteIds = recheckIds.length > 0 ? writeSurvivorsFile(idsFile, recheckIds) : false;
+  let wroteIds = false;
+  if (recheckIds.length > 0) {
+    wroteIds = writeSurvivorsFile(idsFile, recheckIds);
+  } else {
+    rmSync(idsFile, { force: true });
+  }
 
   const heading =
     diffRef !== null

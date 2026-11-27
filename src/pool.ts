@@ -3,7 +3,7 @@ import { killsOf, type LocalWorker, qualifySuiteWithPruning } from "./exec.ts";
 import { type KillableProc, settleProcs } from "./proc.ts";
 import type { BatchPlan, Mutant, VerdictMap } from "./types.ts";
 
-export const UNKNOWN_SUITE_MS = 15_000;
+export const UNKNOWN_SUITE_MS = 4_000;
 
 export interface PoolTask {
   readonly key: string;
@@ -154,14 +154,32 @@ export async function runLocalPool(opts: {
     if (doneKeys.size >= opts.tasks.length) resolveDone?.();
   };
 
-  const firstWorker = opts.workers[0];
   const leadSuites = [
     ...new Set(pending.map((task) => task.plan.active[0]).filter((name): name is string => name !== undefined)),
   ];
-  if (firstWorker !== undefined && Date.now() < opts.deadline) {
-    const why = await ensureQualified(firstWorker, opts.stopAtKill ? leadSuites : [...activeSuites.keys()]);
-    if (why !== null) {
-      return { refused: why, unrun: opts.tasks.length };
+  const initialSuites = (opts.stopAtKill ? leadSuites : [...activeSuites.keys()]).filter(
+    (name) => !opts.localQualified.has(name),
+  );
+  if (opts.workers.length > 0 && initialSuites.length > 0 && Date.now() < opts.deadline) {
+    const queue = [...initialSuites];
+    let firstRefusal: string | null = null;
+    const runners = opts.workers.slice(0, Math.min(opts.workers.length, queue.length));
+    await Promise.all(
+      runners.map(async (worker) => {
+        for (;;) {
+          if (firstRefusal !== null || Date.now() >= opts.deadline) return;
+          const name = queue.shift();
+          if (name === undefined) return;
+          const why = await ensureQualified(worker, [name]);
+          if (why !== null) {
+            firstRefusal ??= why;
+            return;
+          }
+        }
+      }),
+    );
+    if (firstRefusal !== null) {
+      return { refused: firstRefusal, unrun: opts.tasks.length };
     }
   }
 

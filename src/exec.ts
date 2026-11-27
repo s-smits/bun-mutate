@@ -1,19 +1,23 @@
 import {
+  constants,
+  copyFileSync,
   cpSync,
   existsSync,
+  lstatSync,
   mkdirSync,
   mkdtempSync,
   readdirSync,
   readFileSync,
+  readlinkSync,
   rmSync,
   statSync,
   symlinkSync,
   writeFileSync,
 } from "node:fs";
 import { availableParallelism, tmpdir } from "node:os";
-import { isAbsolute, join, relative, resolve } from "node:path";
+import { dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { SUBPROCESS_RE, toPosix } from "./discover.ts";
-import { gitRaw } from "./git.ts";
+import { gitMaybe, gitRaw } from "./git.ts";
 import { applyMutant } from "./mutants.ts";
 import { drainProcess, type KillableProc } from "./proc.ts";
 import { buildTraceSource } from "./schemata.ts";
@@ -22,6 +26,9 @@ import type { BatchPlan, Mutant, VerdictMap } from "./types.ts";
 const VERDICT_RE = /\n *\d+ (pass|fail)|\nBailed out after \d+ failures?/;
 
 const CLONE_SKIP_DIRS = new Set(["node_modules", ".bun-mutate", ".cache", ".turbo", ".next", "coverage"]);
+
+const explicitPath = (path: string): string =>
+  isAbsolute(path) || path.startsWith("./") || path.startsWith("../") ? path : `./${path}`;
 
 export interface LocalWorker {
   readonly id: number;
@@ -123,7 +130,7 @@ async function spawnTest(
       "--bail",
       `--max-concurrency=${String(localConc)}`,
       `--timeout=${String(bunTimeoutMs)}`,
-      ...paths,
+      ...paths.map(explicitPath),
     ],
     {
       cwd,
@@ -392,7 +399,7 @@ export async function qualifySuiteWithPruning(
           "--coverage",
           "--coverage-reporter=lcov",
           `--coverage-dir=${outDir}`,
-          ...paths,
+          ...paths.map(explicitPath),
         ],
         { cwd: worker.clone, stdout: "pipe", stderr: "pipe", detached: true },
       );
@@ -490,27 +497,52 @@ export async function qualifySuiteWithPruning(
   };
 }
 
-function topLevelIgnoredDirs(root: string): Set<string> {
-  const raw = gitRaw(
-    root,
+function cloneGitTree(absRoot: string, absDest: string, skipInsideRoot: string | null): boolean {
+  if (gitMaybe(absRoot, "rev-parse", "--show-prefix") !== "") return false;
+  const listed = gitRaw(
+    absRoot,
     "-c",
     "core.quotePath=false",
     "ls-files",
     "-z",
+    "--cached",
     "--others",
-    "--ignored",
     "--exclude-standard",
-    "--directory",
-    "--no-empty-directory",
   );
-  const ignored = new Set<string>();
-  if (raw === null) return ignored;
-  for (const entry of raw.split("\0")) {
-    if (!entry.endsWith("/")) continue;
-    const trimmed = entry.slice(0, -1);
-    if (trimmed.length > 0 && !trimmed.includes("/")) ignored.add(trimmed);
+  if (listed === null) return false;
+  const made = new Set<string>();
+  for (const rel of listed.split("\0")) {
+    if (rel === "") continue;
+    const top = rel.split("/")[0] ?? "";
+    if (CLONE_SKIP_DIRS.has(top) || top === skipInsideRoot) continue;
+    const src = join(absRoot, rel);
+    let stat: ReturnType<typeof lstatSync>;
+    try {
+      stat = lstatSync(src);
+    } catch {
+      continue;
+    }
+    const dst = join(absDest, rel);
+    const parent = dirname(dst);
+    if (!made.has(parent)) {
+      mkdirSync(parent, { recursive: true });
+      made.add(parent);
+    }
+    if (stat.isSymbolicLink()) symlinkSync(readlinkSync(src), dst);
+    else if (stat.isFile()) copyFileSync(src, dst, constants.COPYFILE_FICLONE);
   }
-  return ignored;
+  const objects = gitMaybe(absRoot, "rev-parse", "--path-format=absolute", "--git-path", "objects");
+  if (objects !== null && gitMaybe(absDest, "init", "-q") !== null) {
+    mkdirSync(join(absDest, ".git", "objects", "info"), { recursive: true });
+    writeFileSync(join(absDest, ".git", "objects", "info", "alternates"), `${objects}\n`);
+    const head = gitMaybe(absRoot, "rev-parse", "-q", "--verify", "HEAD^{commit}");
+    if (head !== null) writeFileSync(join(absDest, ".git", "HEAD"), `${head}\n`);
+    const index = gitMaybe(absRoot, "rev-parse", "--path-format=absolute", "--git-path", "index");
+    if (index !== null && existsSync(index)) {
+      copyFileSync(index, join(absDest, ".git", "index"), constants.COPYFILE_FICLONE);
+    }
+  }
+  return true;
 }
 
 export async function cloneTree(root: string, dest: string): Promise<void> {
@@ -519,11 +551,11 @@ export async function cloneTree(root: string, dest: string): Promise<void> {
   rmSync(absDest, { recursive: true, force: true });
   mkdirSync(absDest, { recursive: true });
   const skipInsideRoot = absDest.startsWith(`${absRoot}/`)
-    ? absDest.slice(absRoot.length + 1).split("/")[0]
+    ? absDest.slice(absRoot.length + 1).split("/")[0] ?? null
     : null;
-  const ignoredDirs = topLevelIgnoredDirs(absRoot);
+  if (cloneGitTree(absRoot, absDest, skipInsideRoot)) return;
   const entries = readdirSync(absRoot).filter(
-    (name) => !CLONE_SKIP_DIRS.has(name) && !ignoredDirs.has(name) && name !== skipInsideRoot,
+    (name) => !CLONE_SKIP_DIRS.has(name) && name !== skipInsideRoot,
   );
   if (entries.length > 0 && (process.platform === "darwin" || process.platform === "linux")) {
     const flag = process.platform === "darwin" ? "-cRp" : "-al";
@@ -554,7 +586,7 @@ export function linkModules(root: string, clone: string): void {
         if (!entry.isDirectory()) continue;
         const pkgMods = join(absWs, entry.name, "node_modules");
         const clonePkgMods = join(clone, wsDir, entry.name, "node_modules");
-        if (existsSync(pkgMods) && !existsSync(clonePkgMods)) {
+        if (existsSync(pkgMods) && existsSync(dirname(clonePkgMods)) && !existsSync(clonePkgMods)) {
           symlinkSync(pkgMods, clonePkgMods);
         }
       }
@@ -703,7 +735,7 @@ export async function measureCoverage(
         `--max-concurrency=${String(maxConc)}`,
         `--timeout=${String(bunTimeoutMs)}`,
         ...covArgs,
-        ...paths,
+        ...paths.map(explicitPath),
       ],
       {
         cwd: root,
