@@ -10,7 +10,7 @@ Measured zero-config on a 12-core Apple Silicon laptop against [s-smits/anabasis
 
 | Workload | Scope | Time | Notes |
 | --- | --- | --- | --- |
-| **End-to-end kernel suite** (`compare.ts`, `reports.ts`, `scheduler.ts`, `climb.ts`) | **1,205 mutants**, 26 suites (`--jobs 5`, shared host) | **24m 05s** | **970/1,205 (80.5%)** settled in-process; **988 killed / 210 survived / 7 unread (82.5%)**; **915/915** exact parity vs prior engine |
+| **End-to-end kernel suite** (`compare.ts`, `reports.ts`, `scheduler.ts`, `climb.ts`) | **1,205 mutants**, 26 suites (`--jobs 5`, shared host) | **20m 07s** | **976/1,205 (81.0%)** settled in-process (`7m 14s`); **988 killed / 210 survived / 7 unread (82.5%)**; **1,205/1,205** exact parity |
 | Pure-suite modules (`prompt.ts`, `names.ts`) | 49 mutants, 2 suites (`--jobs 12`) | **1.2 s** | **40.8 mutants/s** (46/49 settled in-process in 0.7 s) |
 | Stateful isolated suite (`seat-fork.ts`) | 140 mutants, 1 suite (`--jobs 12`) | **10.5 s** | **13.3 mutants/s** across APFS CoW clones + LCOV pruning |
 | Whole-repo AST scan & test index | 467 source files (44,147 mutants), 161 test files | **0.79 s** | Auto-discovered roots, transpiled runtime edges, `#` & `tsconfig` aliases |

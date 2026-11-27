@@ -100,7 +100,8 @@ function collectTargets(
     const entries = Object.entries(spec.suites);
     const names = entries.map(([name]) => name);
     for (const [name, paths] of entries) allSuites.set(name, paths);
-    const wanted = spec.ids === undefined ? null : new Set(spec.ids);
+    const wanted =
+      spec.ids === undefined ? null : new Set(spec.ids.filter((id) => id.startsWith(`${spec.file}:`)));
     const current = mutantsOf(root, spec.file);
     if (wanted !== null && wanted.size > 0) {
       const currentIds = new Set(current.map((mutant) => mutant.id));

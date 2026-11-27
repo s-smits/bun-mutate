@@ -30,7 +30,7 @@ const TS_TRANSPILER = new Bun.Transpiler({ loader: "ts" });
 const TSX_TRANSPILER = new Bun.Transpiler({ loader: "tsx" });
 
 const SCHEMA_HELPERS = `function __bmIf(k: number): boolean { return !__bmHit(k); }
-function __bmNot(k: number, v: unknown): boolean { return __bmHit(k) ? Boolean(v) : !v; }
+function __bmNot(k: number, v: unknown): unknown { return __bmHit(k) ? v : !v; }
 function __bmCond(k: number, v: unknown): boolean { return __bmHit(k) ? !v : Boolean(v); }
 function __bmLit<T>(k: number, orig: T, alt: T): T { return __bmHit(k) ? alt : orig; }
 function __bmL(k: number, op: number, a: () => unknown, b: () => unknown): unknown {
