@@ -5,10 +5,13 @@ export {
   discoverSourceFiles,
   discoverSourceRoots,
   discoverTestFiles,
+  FS_WRITE_RE,
   IMPURE_SUITE_RE,
   isSourceFile,
   isTestFile,
   loadRepoAliases,
+  SCHEMATA_BLOCK_RE,
+  STATEFUL_SUITE_RE,
   SUBPROCESS_RE,
   suiteNameForPath,
   type RepoAliases,
@@ -24,10 +27,12 @@ export {
   measureCoverage,
   parseMultiFileBail,
   qualifySuites,
+  qualifySuiteWithPruning,
   spawnsSubprocess,
   suiteTimeoutSeconds,
   type CoverageResult,
   type KillOutcome,
+  type LazyQualificationResult,
   type LocalWorker,
 } from "./exec.ts";
 export {
@@ -63,9 +68,12 @@ export {
 } from "./runner.ts";
 export {
   buildSchemaSource,
+  buildTraceSource,
+  classifySchemataSuite,
   isSchemataSuite,
   screenFileWithSchemata,
   type SchemataResult,
+  type SuiteProfile,
 } from "./schemata.ts";
 export type {
   BatchPlan,

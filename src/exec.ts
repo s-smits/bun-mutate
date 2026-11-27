@@ -13,9 +13,11 @@ import {
 import { availableParallelism, tmpdir } from "node:os";
 import { isAbsolute, join, relative, resolve } from "node:path";
 import { SUBPROCESS_RE, toPosix } from "./discover.ts";
+import { gitRaw } from "./git.ts";
 import { applyMutant } from "./mutants.ts";
 import { drainProcess, type KillableProc } from "./proc.ts";
-import type { BatchPlan, VerdictMap } from "./types.ts";
+import { buildTraceSource } from "./schemata.ts";
+import type { BatchPlan, Mutant, VerdictMap } from "./types.ts";
 
 const VERDICT_RE = /\n *\d+ (pass|fail)|\nBailed out after \d+ failures?/;
 
@@ -28,7 +30,7 @@ export interface LocalWorker {
 
 export function suiteTimeoutSeconds(capSeconds: number, durationMs: number | undefined): number {
   if (durationMs === undefined) return capSeconds;
-  return Math.min(capSeconds, Math.max(35, Math.ceil((durationMs / 1000) * 12)));
+  return Math.min(capSeconds, Math.max(12, Math.ceil((durationMs / 1000) * 12) + 8));
 }
 
 export function combinedTimeoutSeconds(
@@ -42,7 +44,7 @@ export function combinedTimeoutSeconds(
     if (ms === undefined) return capSeconds;
     totalMs += ms;
   }
-  return Math.min(capSeconds, Math.max(35, Math.ceil((totalMs / 1000) * 10) + 15));
+  return Math.min(capSeconds, Math.max(15, Math.ceil((totalMs / 1000) * 10) + 10));
 }
 
 export function canCombineSuites(
@@ -151,6 +153,7 @@ export type KillOutcome =
 
 async function runSoloRest(
   seat: LocalWorker,
+  mutant: Mutant,
   rest: readonly string[],
   seed: VerdictMap,
   opts: {
@@ -161,6 +164,7 @@ async function runSoloRest(
     readonly localConc: number;
     readonly activeProcs?: Set<KillableProc>;
     readonly beforeSuite?: ((name: string) => Promise<string | null>) | undefined;
+    readonly isPruned?: ((name: string, mutant: Mutant) => boolean) | undefined;
   },
 ): Promise<KillOutcome> {
   const out: VerdictMap = { ...seed };
@@ -173,6 +177,10 @@ async function runSoloRest(
     if (opts.beforeSuite !== undefined) {
       const why = await opts.beforeSuite(name);
       if (why !== null) return { kind: "refused", why };
+    }
+    if (opts.isPruned?.(name, mutant) === true) {
+      out[name] = false;
+      continue;
     }
     const timeoutSec = suiteTimeoutSeconds(opts.seconds, opts.durations.get(name));
     out[name] = await verdict(
@@ -204,6 +212,7 @@ export async function killsOf(
     readonly localConc: number;
     readonly activeProcs?: Set<KillableProc>;
     readonly beforeSuite?: ((name: string) => Promise<string | null>) | undefined;
+    readonly isPruned?: ((name: string, mutant: Mutant) => boolean) | undefined;
   },
 ): Promise<KillOutcome> {
   const { mutant, active } = plan;
@@ -227,13 +236,16 @@ export async function killsOf(
     if (lead !== undefined && canCombineSuites(rest, opts.suites, opts.stopAtKill)) {
       const leadWhy = await qualifyClean([lead]);
       if (leadWhy !== null) return { kind: "refused", why: leadWhy };
-      const leadSaid = await verdict(
-        seat.clone,
-        opts.suites.get(lead) ?? [],
-        suiteTimeoutSeconds(opts.seconds, opts.durations.get(lead)),
-        opts.localConc,
-        opts.activeProcs,
-      );
+      const leadSaid =
+        opts.isPruned?.(lead, mutant) === true
+          ? false
+          : await verdict(
+              seat.clone,
+              opts.suites.get(lead) ?? [],
+              suiteTimeoutSeconds(opts.seconds, opts.durations.get(lead)),
+              opts.localConc,
+              opts.activeProcs,
+            );
       if (leadSaid === true) {
         return {
           kind: "ok",
@@ -242,19 +254,37 @@ export async function killsOf(
       }
       const restWhy = await qualifyClean(rest);
       if (restWhy !== null) return { kind: "refused", why: restWhy };
-      const paths = rest.flatMap((name) => opts.suites.get(name) ?? []);
+      const prunedRest: VerdictMap = {};
+      const liveRest: string[] = [];
+      for (const name of rest) {
+        if (opts.isPruned?.(name, mutant) === true) prunedRest[name] = false;
+        else liveRest.push(name);
+      }
+      if (liveRest.length === 0) {
+        return { kind: "ok", killed: { [lead]: leadSaid, ...prunedRest } };
+      }
+      if (liveRest.length === 1) {
+        const fallback = await runSoloRest(seat, mutant, liveRest, prunedRest, {
+          ...opts,
+          beforeSuite: undefined,
+        });
+        return fallback.kind === "ok"
+          ? { kind: "ok", killed: { [lead]: leadSaid, ...fallback.killed } }
+          : fallback;
+      }
+      const paths = liveRest.flatMap((name) => opts.suites.get(name) ?? []);
       const batch = parseMultiFileBail(
-        rest,
+        liveRest,
         opts.suites,
         await spawnTest(
           seat.clone,
           paths,
-          combinedTimeoutSeconds(opts.seconds, rest, opts.durations),
+          combinedTimeoutSeconds(opts.seconds, liveRest, opts.durations),
           opts.localConc,
           opts.activeProcs,
         ),
       );
-      const blamed = rest.find((name) => batch[name] === true);
+      const blamed = liveRest.find((name) => batch[name] === true);
       if (blamed !== undefined) {
         const solo = await verdict(
           seat.clone,
@@ -263,34 +293,33 @@ export async function killsOf(
           opts.localConc,
           opts.activeProcs,
         );
-        if (solo === true) return { kind: "ok", killed: { [lead]: leadSaid, ...batch } };
+        if (solo === true) return { kind: "ok", killed: { [lead]: leadSaid, ...prunedRest, ...batch } };
         const fallback = await runSoloRest(
           seat,
-          rest,
-          { [blamed]: solo },
+          mutant,
+          liveRest,
+          { ...prunedRest, [blamed]: solo },
           { ...opts, beforeSuite: undefined },
         );
         return fallback.kind === "ok"
           ? { kind: "ok", killed: { [lead]: leadSaid, ...fallback.killed } }
           : fallback;
       }
-      if (rest.some((name) => batch[name] === null)) {
-        const fallback = await runSoloRest(seat, rest, batch, { ...opts, beforeSuite: undefined });
+      if (liveRest.some((name) => batch[name] === null)) {
+        const fallback = await runSoloRest(seat, mutant, liveRest, { ...prunedRest, ...batch }, {
+          ...opts,
+          beforeSuite: undefined,
+        });
         return fallback.kind === "ok"
           ? { kind: "ok", killed: { [lead]: leadSaid, ...fallback.killed } }
           : fallback;
       }
-      return { kind: "ok", killed: { [lead]: leadSaid, ...batch } };
+      return { kind: "ok", killed: { [lead]: leadSaid, ...prunedRest, ...batch } };
     }
-    return await runSoloRest(
-      seat,
-      active,
-      {},
-      {
-        ...opts,
-        beforeSuite: opts.beforeSuite === undefined ? undefined : (name) => qualifyClean([name]),
-      },
-    );
+    return await runSoloRest(seat, mutant, active, {}, {
+      ...opts,
+      beforeSuite: opts.beforeSuite === undefined ? undefined : (name) => qualifyClean([name]),
+    });
   } finally {
     restore();
   }
@@ -313,6 +342,177 @@ export async function qualifySuites(
   return null;
 }
 
+export interface LazyQualificationResult {
+  readonly refused: string | null;
+  readonly durationMs: number;
+  readonly uncovered?: Map<string, Set<number>>;
+  readonly covered?: Map<string, number>;
+  readonly unreachedIds?: Map<string, Set<string>>;
+}
+
+export async function qualifySuiteWithPruning(
+  worker: LocalWorker,
+  name: string,
+  paths: readonly string[],
+  opts: {
+    readonly root: string;
+    readonly files: readonly string[];
+    readonly originals: ReadonlyMap<string, string>;
+    readonly mutantsByFile: ReadonlyMap<string, readonly Mutant[]>;
+    readonly helperFiles: readonly string[];
+    readonly prune: boolean;
+    readonly seconds: number;
+    readonly localConc: number;
+  },
+): Promise<LazyQualificationResult> {
+  if (paths.length === 0) return { refused: "no suites given", durationMs: 0 };
+  const sub = spawnsSubprocess(opts.root, paths, opts.helperFiles);
+  if (!opts.prune) {
+    const t0 = Date.now();
+    const said = await verdict(worker.clone, paths, opts.seconds, opts.localConc);
+    const durationMs = Math.max(1, Date.now() - t0);
+    if (said === false) return { refused: null, durationMs };
+    return {
+      refused: `baseline suite "${name}" did not pass unmutated (${said === true ? "failed" : "no verdict"})`,
+      durationMs,
+    };
+  }
+  if (!sub) {
+    const outDir = mkdtempSync(join(tmpdir(), "bm-lcov-"));
+    try {
+      const t0 = Date.now();
+      const bunTimeoutMs = Math.max(60_000, Math.ceil(opts.seconds * 1000) + 5_000);
+      const run = Bun.spawn(
+        [
+          process.execPath,
+          "test",
+          "--bail",
+          `--max-concurrency=${String(opts.localConc)}`,
+          `--timeout=${String(bunTimeoutMs)}`,
+          "--coverage",
+          "--coverage-reporter=lcov",
+          `--coverage-dir=${outDir}`,
+          ...paths,
+        ],
+        { cwd: worker.clone, stdout: "pipe", stderr: "pipe", detached: true },
+      );
+      const { said, code, signalled } = await drainProcess(run, opts.seconds);
+      const durationMs = Math.max(1, Date.now() - t0);
+      const ok = !signalled && code === 0 && VERDICT_RE.test(said);
+      if (!ok) {
+        const reason = !signalled && VERDICT_RE.test(said) && code !== 0 ? "failed" : "no verdict";
+        return {
+          refused: `baseline suite "${name}" did not pass unmutated (${reason})`,
+          durationMs,
+        };
+      }
+      const lcovFile = join(outDir, "lcov.info");
+      if (existsSync(lcovFile)) {
+        const parsed = parseCoverage(
+          worker.clone,
+          readFileSync(lcovFile, "utf8"),
+          new Set(opts.files.map(toPosix)),
+        );
+        return { refused: null, durationMs, uncovered: parsed.uncovered, covered: parsed.covered };
+      }
+      return { refused: null, durationMs };
+    } finally {
+      rmSync(outDir, { recursive: true, force: true });
+    }
+  }
+  // Subprocess-spawning suite: instrument target files on disk in this worker's clone once to record
+  // exact reachability across parent + all child processes; fail closed to plain baseline on error.
+  const traceDir = mkdtempSync(join(tmpdir(), "bm-trace-"));
+  const written: Array<{
+    readonly file: string;
+    readonly tracePath: string;
+    readonly encoded: ReadonlyMap<number, Mutant>;
+  }> = [];
+  try {
+    let idx = 0;
+    for (const file of opts.files) {
+      const original = opts.originals.get(file);
+      const fileMutants = opts.mutantsByFile.get(file);
+      if (original === undefined || fileMutants === undefined || fileMutants.length === 0) continue;
+      idx += 1;
+      const tracePath = join(traceDir, `t-${String(idx)}.txt`);
+      const built = buildTraceSource(file, original, fileMutants, tracePath);
+      if (built.source === null || built.encoded.size === 0) continue;
+      replaceFile(join(worker.clone, file), built.source);
+      written.push({ file, tracePath, encoded: built.encoded });
+    }
+    if (written.length > 0) {
+      const t0 = Date.now();
+      const said = await verdict(worker.clone, paths, opts.seconds, opts.localConc);
+      const durationMs = Math.max(1, Date.now() - t0);
+      for (const item of written) {
+        const orig = opts.originals.get(item.file);
+        if (orig !== undefined) replaceFile(join(worker.clone, item.file), orig);
+      }
+      if (said === false) {
+        const unreachedIds = new Map<string, Set<string>>();
+        const covered = new Map<string, number>();
+        for (const item of written) {
+          const hitIndices = new Set<number>();
+          if (existsSync(item.tracePath)) {
+            for (const line of readFileSync(item.tracePath, "utf8").split("\n")) {
+              const trimmed = line.trim();
+              if (trimmed.length > 0) hitIndices.add(Number(trimmed));
+            }
+          }
+          const unreached = new Set<string>();
+          let reachedCount = 0;
+          for (const [k, mutant] of item.encoded) {
+            if (hitIndices.has(k)) reachedCount += 1;
+            else unreached.add(mutant.id);
+          }
+          if (unreached.size > 0) unreachedIds.set(item.file, unreached);
+          if (reachedCount > 0) covered.set(item.file, reachedCount);
+        }
+        return { refused: null, durationMs, unreachedIds, covered };
+      }
+    }
+  } finally {
+    for (const item of written) {
+      const orig = opts.originals.get(item.file);
+      if (orig !== undefined) replaceFile(join(worker.clone, item.file), orig);
+    }
+    rmSync(traceDir, { recursive: true, force: true });
+  }
+  // Fail-closed fallback: plain uninstrumented baseline qualification with no pruning for this suite.
+  const t0 = Date.now();
+  const said = await verdict(worker.clone, paths, opts.seconds, opts.localConc);
+  const durationMs = Math.max(1, Date.now() - t0);
+  if (said === false) return { refused: null, durationMs };
+  return {
+    refused: `baseline suite "${name}" did not pass unmutated (${said === true ? "failed" : "no verdict"})`,
+    durationMs,
+  };
+}
+
+function topLevelIgnoredDirs(root: string): Set<string> {
+  const raw = gitRaw(
+    root,
+    "-c",
+    "core.quotePath=false",
+    "ls-files",
+    "-z",
+    "--others",
+    "--ignored",
+    "--exclude-standard",
+    "--directory",
+    "--no-empty-directory",
+  );
+  const ignored = new Set<string>();
+  if (raw === null) return ignored;
+  for (const entry of raw.split("\0")) {
+    if (!entry.endsWith("/")) continue;
+    const trimmed = entry.slice(0, -1);
+    if (trimmed.length > 0 && !trimmed.includes("/")) ignored.add(trimmed);
+  }
+  return ignored;
+}
+
 export async function cloneTree(root: string, dest: string): Promise<void> {
   const absRoot = resolve(root);
   const absDest = resolve(dest);
@@ -321,8 +521,9 @@ export async function cloneTree(root: string, dest: string): Promise<void> {
   const skipInsideRoot = absDest.startsWith(`${absRoot}/`)
     ? absDest.slice(absRoot.length + 1).split("/")[0]
     : null;
+  const ignoredDirs = topLevelIgnoredDirs(absRoot);
   const entries = readdirSync(absRoot).filter(
-    (name) => !CLONE_SKIP_DIRS.has(name) && name !== skipInsideRoot,
+    (name) => !CLONE_SKIP_DIRS.has(name) && !ignoredDirs.has(name) && name !== skipInsideRoot,
   );
   if (entries.length > 0 && (process.platform === "darwin" || process.platform === "linux")) {
     const flag = process.platform === "darwin" ? "-cRp" : "-al";

@@ -1,10 +1,11 @@
 import { describe, expect, it } from "bun:test";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   buildTestIndex,
   changedLinesInDiff,
+  cloneTree,
   detectDefaultBase,
   discoverSourceFiles,
   discoverSourceRoots,
@@ -172,6 +173,41 @@ describe("automatic repo discovery and path aliases", () => {
       expect(index.suitesFor("src/core.ts")).toEqual(["test/z-unit.test.ts", "test/a-integration.test.ts"]);
     } finally {
       rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("respects .gitignore during discovery and Stage-2 tree cloning", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "bm-gitignore-"));
+    const clone = mkdtempSync(join(tmpdir(), "bm-gitignore-clone-"));
+    try {
+      runGit(dir, "init", "-b", "main");
+      runGit(dir, "config", "user.email", "test@example.com");
+      runGit(dir, "config", "user.name", "Test");
+
+      mkdirSync(join(dir, "src"), { recursive: true });
+      mkdirSync(join(dir, "test"), { recursive: true });
+      mkdirSync(join(dir, ".huge-artifacts", "nested"), { recursive: true });
+      mkdirSync(join(dir, "data"), { recursive: true });
+
+      writeFileSync(join(dir, ".gitignore"), ".huge-artifacts/\ndata/\n");
+      writeFileSync(join(dir, "src", "app.ts"), "export const ok = (x: number) => x > 0;\n");
+      writeFileSync(
+        join(dir, "test", "app.test.ts"),
+        'import { expect, it } from "bun:test";\nimport { ok } from "../src/app.ts";\nit("ok", () => expect(ok(1)).toBe(true));\n',
+      );
+      writeFileSync(join(dir, ".huge-artifacts", "nested", "ignored.test.ts"), "export const x = 1;\n");
+      writeFileSync(join(dir, "data", "ignored.ts"), "export const y = 2;\n");
+
+      expect(discoverSourceFiles(dir)).toEqual(["src/app.ts"]);
+      expect(discoverTestFiles(dir)).toEqual(["test/app.test.ts"]);
+
+      await cloneTree(dir, clone);
+      expect(existsSync(join(clone, "src", "app.ts"))).toBe(true);
+      expect(existsSync(join(clone, ".huge-artifacts"))).toBe(false);
+      expect(existsSync(join(clone, "data"))).toBe(false);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+      rmSync(clone, { recursive: true, force: true });
     }
   });
 });

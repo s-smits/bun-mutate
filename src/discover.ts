@@ -1,6 +1,7 @@
 import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
 import { dirname, isAbsolute, join, relative, resolve } from "node:path";
 import * as ts from "typescript";
+import { gitRaw } from "./git.ts";
 
 const IGNORED_DIRS = new Set([
   "node_modules",
@@ -26,8 +27,16 @@ const TEST_HELPER_RE = /(?:^|\/)(?:test|tests|__tests__|helpers?|fixtures?)(?:\/
 export const SUBPROCESS_RE =
   /\b(?:Bun\.spawn|Bun\.spawnSync|spawnSync|execSync|execFileSync|child_process)\b|node:child_process/u;
 
+export const FS_WRITE_RE =
+  /\b(?:writeFileSync|mkdtempSync|rmSync|mkdirSync|appendFileSync|renameSync|copyFileSync|cpSync|symlinkSync|chmodSync|Bun\.write)\b|fs\/promises/u;
+
+export const STATEFUL_SUITE_RE =
+  /\b(?:writeFileSync|mkdtempSync|rmSync|mkdirSync|appendFileSync|renameSync|copyFileSync|cpSync|symlinkSync|chmodSync|Bun\.write|spyOn|beforeAll|afterAll|process\.env|Bun\.env|fetch|createServer|Bun\.serve)\b|fs\/promises/u;
+
+export const SCHEMATA_BLOCK_RE = /\b(?:mock\.module)\b|\.only\b/u;
+
 export const IMPURE_SUITE_RE =
-  /\b(?:writeFileSync|mkdtempSync|rmSync|mkdirSync|appendFileSync|renameSync|copyFileSync|cpSync|symlinkSync|chmodSync|Bun\.spawn|Bun\.spawnSync|spawnSync|execSync|execFileSync|child_process|mock\.module|spyOn|setDefaultTimeout|beforeAll|afterAll|process\.env|Bun\.env|fetch|createServer|Bun\.serve)\b|\.(?:each|only|skip|todo)\b/u;
+  /\b(?:writeFileSync|mkdtempSync|rmSync|mkdirSync|appendFileSync|renameSync|copyFileSync|cpSync|symlinkSync|chmodSync|Bun\.write|Bun\.spawn|Bun\.spawnSync|spawnSync|execSync|execFileSync|child_process|mock\.module|spyOn|setDefaultTimeout|beforeAll|afterAll|process\.env|Bun\.env|fetch|createServer|Bun\.serve)\b|fs\/promises|\.(?:each|only|skip|todo|if|skipIf|todoIf|failing)\b/u;
 
 const TS_TRANSPILER = new Bun.Transpiler({ loader: "ts" });
 const TSX_TRANSPILER = new Bun.Transpiler({ loader: "tsx" });
@@ -261,7 +270,7 @@ function walkFiles(root: string, startRel: string, keep: (rel: string) => boolea
     }
     for (const entry of entries) {
       if (entry.isDirectory()) {
-        if (IGNORED_DIRS.has(entry.name)) continue;
+        if (entry.name.startsWith(".") || IGNORED_DIRS.has(entry.name)) continue;
         stack.push(join(dir, entry.name));
       } else if (entry.isFile()) {
         const rel = toPosix(relative(root, join(dir, entry.name)));
@@ -271,8 +280,23 @@ function walkFiles(root: string, startRel: string, keep: (rel: string) => boolea
   }
 }
 
+function listGitFiles(root: string): string[] | null {
+  const raw = gitRaw(root, "-c", "core.quotePath=false", "ls-files", "-z", "--cached", "--others", "--exclude-standard");
+  if (raw === null) return null;
+  return raw
+    .split("\0")
+    .filter((entry) => entry.length > 0)
+    .map(toPosix);
+}
+
 export function discoverSourceFiles(root: string): string[] {
   const roots = discoverSourceRoots(root);
+  const gitFiles = listGitFiles(root);
+  if (gitFiles !== null) {
+    const inRoots = (rel: string): boolean =>
+      roots.length === 0 || roots.some((dir) => rel === dir || rel.startsWith(`${dir}/`));
+    return gitFiles.filter((rel) => inRoots(rel) && isSourceFile(rel) && existsSync(join(root, rel))).toSorted();
+  }
   const files = new Set<string>();
   if (roots.length === 0) {
     walkFiles(root, "", isSourceFile, files);
@@ -283,6 +307,10 @@ export function discoverSourceFiles(root: string): string[] {
 }
 
 export function discoverTestFiles(root: string): string[] {
+  const gitFiles = listGitFiles(root);
+  if (gitFiles !== null) {
+    return gitFiles.filter((rel) => isTestFile(rel) && existsSync(join(root, rel))).toSorted();
+  }
   const tests = new Set<string>();
   walkFiles(root, "", isTestFile, tests);
   return [...tests].toSorted();

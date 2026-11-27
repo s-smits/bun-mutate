@@ -5,7 +5,7 @@ import { collectSuiteHelperDeps, type TestIndex } from "./discover.ts";
 import { cloneTree, linkModules, type LocalWorker, measureCoverage, spawnsSubprocess } from "./exec.ts";
 import { gitMaybe } from "./git.ts";
 import { mutantsOf } from "./mutants.ts";
-import { type PoolTask, runLocalPool } from "./pool.ts";
+import { type PoolTask, runLocalPool, UNKNOWN_SUITE_MS } from "./pool.ts";
 import { screenFileWithSchemata } from "./schemata.ts";
 import type { KillMode, Mutant, ResultRow, TargetSpec, VerdictMap } from "./types.ts";
 
@@ -158,7 +158,7 @@ function buildPoolTasks(opts: {
     if (active.length === 0) {
       opts.record(item, finalizeRow(item.suites, opts.priorById.get(item.mutant.id), {}, opts.mode));
     } else {
-      const weightMs = active.reduce((sum, name) => sum + (opts.durations.get(name) ?? 1000), 0);
+      const weightMs = active.reduce((sum, name) => sum + (opts.durations.get(name) ?? UNKNOWN_SUITE_MS), 0);
       tasks.push({ key: item.mutant.id, plan: { mutant: item.mutant, active }, weightMs });
     }
   }
@@ -209,45 +209,158 @@ export async function runMutationSpecs(opts: RunOptions): Promise<RunSummary> {
     rows.push(row);
   };
 
-  // Stage 1: In-process mutant schemata for eligible pure suites.
+  // Shared lazy CoW/hardlink worker pool reused by both stateful schemata and isolated execution.
+  let ephemeralRoot: string | null = null;
+  const preparedWorkers = new Map<number, LocalWorker>();
+  const head = gitMaybe(opts.root, "rev-parse", "HEAD");
+  const stamp =
+    (opts.clonesPrefix ?? null) !== null && head !== null && gitMaybe(opts.root, "status", "--porcelain") === ""
+      ? `${opts.root}\n${head}`
+      : null;
+  let cloneBase: string | null = null;
+
+  const ensureWorkers = async (count: number): Promise<LocalWorker[]> => {
+    const needed = Math.max(1, Math.min(concurrency, count));
+    if (cloneBase === null) {
+      if (opts.clonesPrefix === null || opts.clonesPrefix === undefined) {
+        ephemeralRoot = mkdtempSync(join(tmpdir(), "bun-mutate-clones-"));
+        cloneBase = join(ephemeralRoot, "slot");
+      } else {
+        cloneBase = opts.clonesPrefix;
+      }
+    }
+    const base = cloneBase;
+    const toPrep: LocalWorker[] = [];
+    for (let id = 0; id < needed; id += 1) {
+      if (!preparedWorkers.has(id)) {
+        const w: LocalWorker = { id, clone: `${base}-${String(id)}` };
+        preparedWorkers.set(id, w);
+        toPrep.push(w);
+      }
+    }
+    await Promise.all(
+      toPrep.map(async (worker) => {
+        const stampPath = join(worker.clone, STAMP_FILE);
+        const reusable = stamp !== null && existsSync(stampPath) && readFileSync(stampPath, "utf8") === stamp;
+        if (!reusable) {
+          await cloneTree(opts.root, worker.clone);
+          if (stamp !== null) writeFileSync(stampPath, stamp);
+        }
+        linkModules(opts.root, worker.clone);
+        for (const [file, text] of originals) {
+          const target = join(worker.clone, file);
+          rmSync(target, { force: true });
+          writeFileSync(target, text);
+        }
+      }),
+    );
+    const out: LocalWorker[] = [];
+    for (let id = 0; id < needed; id += 1) {
+      const w = preparedWorkers.get(id);
+      if (w !== undefined) out.push(w);
+    }
+    return out;
+  };
+
+  const ensureSandboxes = async (): Promise<readonly string[]> => {
+    const ws = await ensureWorkers(concurrency);
+    return ws.map((w) => w.clone);
+  };
+
   const priorById = new Map<string, Map<string, boolean | null>>();
   const localQualified = new Set<string>();
   const durations = new Map<string, number>();
   let schemataEncoded = 0;
 
-  if (enableSchemata && Date.now() < deadline) {
-    const stage1Start = Date.now();
-    const byFile = Map.groupBy(todo, (item) => item.mutant.file);
-    for (const [file, items] of byFile) {
-      if (Date.now() >= deadline) break;
-      const suiteOrder = [...new Set(items.flatMap((item) => item.suites))];
-      const res = await screenFileWithSchemata({
-        root: opts.root,
-        file,
-        source: originals.get(file) ?? "",
-        mutants: items.map((item) => item.mutant),
-        suites: allSuites,
-        suiteOrder,
+  try {
+    if (enableSchemata && Date.now() < deadline) {
+      const schemataStart = Date.now();
+      const byFile = Map.groupBy(todo, (item) => item.mutant.file);
+      let fileIdx = 0;
+      for (const [file, items] of byFile) {
+        if (Date.now() >= deadline) break;
+        fileIdx += 1;
+        const fileStart = Date.now();
+        const suiteOrder = [...new Set(items.flatMap((item) => item.suites))];
+        const res = await screenFileWithSchemata({
+          root: opts.root,
+          file,
+          source: originals.get(file) ?? "",
+          mutants: items.map((item) => item.mutant),
+          suites: allSuites,
+          suiteOrder,
+          helperFiles,
+          ensureSandboxes,
+          capSeconds: seconds,
+          stopAtKill,
+          concurrency,
+        });
+        schemataEncoded += res.encodedCount;
+        for (const name of res.qualifiedSuites) localQualified.add(name);
+        for (const [name, ms] of res.durations) durations.set(name, ms);
+        for (const [id, row] of res.verdicts) priorById.set(id, row);
+        if (res.encodedCount > 0 && res.qualifiedSuites.size > 0) {
+          let settledHere = 0;
+          for (const item of items) {
+            const prior = res.verdicts.get(item.mutant.id);
+            if (prior === undefined) continue;
+            const killed = mode === "stop-at-kill" && [...prior.values()].includes(true);
+            const allDone = item.suites.every((name) => prior.has(name));
+            if (killed || allDone) settledHere += 1;
+          }
+          const fSec = ((Date.now() - fileStart) / 1000).toFixed(1);
+          progress(
+            `schemata [${String(fileIdx)}/${String(byFile.size)}] ${file}: ${String(settledHere)}/${String(items.length)} settled in ${fSec}s`,
+          );
+        }
+      }
+      const settledBeforeSplit = rows.length;
+      const afterSchemata = splitAfterSchema(todo, priorById, mode, record);
+      const settledInSchemata = rows.length - settledBeforeSplit;
+      if (schemataEncoded > 0 && localQualified.size > 0) {
+        const sec = ((Date.now() - schemataStart) / 1000).toFixed(1);
+        progress(
+          `schemata: ${String(settledInSchemata)}/${String(todo.length)} settled in ${sec}s (${String(afterSchemata.length)} remaining)`,
+        );
+      }
+      if (afterSchemata.length === 0) {
+        return {
+          run: rows.length,
+          heldBefore,
+          unrun: 0,
+          refused: null,
+          staleWarnings,
+          schemataEncoded,
+          rows,
+        };
+      }
+      return await runIsolatedPool({
+        opts,
+        afterSchema: afterSchemata,
+        originals,
+        allSuites,
         helperFiles,
-        capSeconds: seconds,
-        stopAtKill,
+        priorById,
+        localQualified,
+        durations,
+        ensureWorkers,
         concurrency,
+        seconds,
+        deadline,
+        prune,
+        mode,
+        stopAtKill,
+        heldBefore,
+        staleWarnings,
+        schemataEncoded,
+        rows,
+        record,
+        progress,
       });
-      schemataEncoded += res.encodedCount;
-      for (const name of res.qualifiedSuites) localQualified.add(name);
-      for (const [name, ms] of res.durations) durations.set(name, ms);
-      for (const [id, row] of res.verdicts) priorById.set(id, row);
     }
-    const settledBeforeSplit = rows.length;
-    const afterStage1 = splitAfterSchema(todo, priorById, mode, record);
-    const settledInStage1 = rows.length - settledBeforeSplit;
-    if (schemataEncoded > 0 && localQualified.size > 0) {
-      const sec = ((Date.now() - stage1Start) / 1000).toFixed(1);
-      progress(
-        `stage 1 (schemata): ${String(settledInStage1)}/${String(todo.length)} settled in ${sec}s (${String(afterStage1.length)} remaining)`,
-      );
-    }
-    if (afterStage1.length === 0) {
+
+    const afterSchema = splitAfterSchema(todo, priorById, mode, record);
+    if (afterSchema.length === 0) {
       return {
         run: rows.length,
         heldBefore,
@@ -258,15 +371,16 @@ export async function runMutationSpecs(opts: RunOptions): Promise<RunSummary> {
         rows,
       };
     }
-    return await runStage2({
+    return await runIsolatedPool({
       opts,
-      afterSchema: afterStage1,
+      afterSchema,
       originals,
       allSuites,
       helperFiles,
       priorById,
       localQualified,
       durations,
+      ensureWorkers,
       concurrency,
       seconds,
       deadline,
@@ -280,45 +394,12 @@ export async function runMutationSpecs(opts: RunOptions): Promise<RunSummary> {
       record,
       progress,
     });
+  } finally {
+    if (ephemeralRoot !== null) rmSync(ephemeralRoot, { recursive: true, force: true });
   }
-
-  const afterSchema = splitAfterSchema(todo, priorById, mode, record);
-  if (afterSchema.length === 0) {
-    return {
-      run: rows.length,
-      heldBefore,
-      unrun: 0,
-      refused: null,
-      staleWarnings,
-      schemataEncoded,
-      rows,
-    };
-  }
-  return await runStage2({
-    opts,
-    afterSchema,
-    originals,
-    allSuites,
-    helperFiles,
-    priorById,
-    localQualified,
-    durations,
-    concurrency,
-    seconds,
-    deadline,
-    prune,
-    mode,
-    stopAtKill,
-    heldBefore,
-    staleWarnings,
-    schemataEncoded,
-    rows,
-    record,
-    progress,
-  });
 }
 
-async function runStage2(ctx: {
+async function runIsolatedPool(ctx: {
   readonly opts: RunOptions;
   readonly afterSchema: readonly PendingItem[];
   readonly originals: ReadonlyMap<string, string>;
@@ -327,6 +408,7 @@ async function runStage2(ctx: {
   readonly priorById: ReadonlyMap<string, Map<string, boolean | null>>;
   readonly localQualified: Set<string>;
   readonly durations: Map<string, number>;
+  readonly ensureWorkers: (count: number) => Promise<LocalWorker[]>;
   readonly concurrency: number;
   readonly seconds: number;
   readonly deadline: number;
@@ -349,6 +431,7 @@ async function runStage2(ctx: {
     priorById,
     localQualified,
     durations,
+    ensureWorkers,
     concurrency,
     seconds,
     deadline,
@@ -365,137 +448,104 @@ async function runStage2(ctx: {
   const cacheDir = opts.covCache ?? null;
   const hasCache = cacheDir !== null && existsSync(cacheDir);
   const demand = new Map<string, number>();
-  const leadSet = new Set<string>();
-  const leadNeeded = new Set<string>();
   for (const { rest } of afterSchema) {
-    if (rest[0] !== undefined) leadSet.add(rest[0]);
     for (const name of rest) demand.set(name, (demand.get(name) ?? 0) + 1);
-    const keep =
-      mode !== "stop-at-kill" || rest.length < 2
-        ? rest
-        : rest.slice(0, Math.min(rest.length - 1, Math.max(1, Math.floor((rest.length * 2) / 3))));
-    for (const name of keep) leadNeeded.add(name);
   }
+  // Measure upfront LCOV for non-subprocess suites with repeated demand; remaining suites
+  // (including subprocess suites) get lazy LCOV or source-instrumented reachability on first reach.
   const covSuites = new Map(
     [...allSuites.entries()].filter(([name, paths]) => {
-      if (!leadNeeded.has(name) || localQualified.has(name)) return false;
+      if (localQualified.has(name)) return false;
       const count = demand.get(name) ?? 0;
       if (count < 3 && !hasCache) return false;
-      if (spawnsSubprocess(opts.root, paths, helperFiles.get(name))) {
-        return hasCache || (count >= 5 && leadSet.has(name));
-      }
-      return true;
+      return !spawnsSubprocess(opts.root, paths, helperFiles.get(name));
     }),
   );
   const runCov = prune && covSuites.size > 0 && (afterSchema.length >= 5 || hasCache);
-
-  const ephemeralRoot =
-    opts.clonesPrefix === null || opts.clonesPrefix === undefined
-      ? mkdtempSync(join(tmpdir(), "bun-mutate-clones-"))
-      : null;
-  const cloneBase = opts.clonesPrefix ?? join(ephemeralRoot ?? tmpdir(), "slot");
-  const head = gitMaybe(opts.root, "rev-parse", "HEAD");
-  const stamp =
-    ephemeralRoot === null && head !== null && gitMaybe(opts.root, "status", "--porcelain") === ""
-      ? `${opts.root}\n${head}`
-      : null;
-
   const slotCount = Math.min(concurrency, afterSchema.length);
-  const workers: LocalWorker[] = Array.from({ length: slotCount }, (_, id) => ({
-    id,
-    clone: `${cloneBase}-${String(id)}`,
-  }));
-
-  const prepareWorker = async (worker: LocalWorker): Promise<void> => {
-    const stampPath = join(worker.clone, STAMP_FILE);
-    const reusable = stamp !== null && existsSync(stampPath) && readFileSync(stampPath, "utf8") === stamp;
-    if (!reusable) {
-      await cloneTree(opts.root, worker.clone);
-      if (stamp !== null) writeFileSync(stampPath, stamp);
-    }
-    linkModules(opts.root, worker.clone);
-    for (const [file, text] of originals) {
-      const target = join(worker.clone, file);
-      rmSync(target, { force: true });
-      writeFileSync(target, text);
-    }
-  };
 
   progress(
-    `stage 2 (isolated): ${String(afterSchema.length)} mutant(s) across ${String(slotCount)} worker(s)${runCov ? ` + ${String(covSuites.size)} coverage suite(s)` : ""}`,
+    `isolated: ${String(afterSchema.length)} mutant(s) across ${String(slotCount)} worker(s)${runCov ? ` + ${String(covSuites.size)} coverage suite(s)` : ""}`,
   );
 
-  try {
-    const [cov] = await Promise.all([
-      runCov
-        ? measureCoverage(opts.root, covSuites, [...originals.keys()], {
-            seconds,
-            cacheDir,
-            concurrency,
-            helperFiles,
-          })
-        : Promise.resolve({
-            uncovered: new Map<string, Map<string, Set<number>>>(),
-            covered: new Map<string, Map<string, number>>(),
-            passed: new Set<string>(),
-            durations: new Map<string, number>(),
-          }),
-      Promise.all(workers.map(prepareWorker)),
-    ]);
-    for (const name of cov.passed) localQualified.add(name);
-    for (const [name, ms] of cov.durations) durations.set(name, ms);
+  const [cov, workers] = await Promise.all([
+    runCov
+      ? measureCoverage(opts.root, covSuites, [...originals.keys()], {
+          seconds,
+          cacheDir,
+          concurrency,
+          helperFiles,
+        })
+      : Promise.resolve({
+          uncovered: new Map<string, Map<string, Set<number>>>(),
+          covered: new Map<string, Map<string, number>>(),
+          passed: new Set<string>(),
+          durations: new Map<string, number>(),
+        }),
+    ensureWorkers(slotCount),
+  ]);
+  for (const name of cov.passed) localQualified.add(name);
+  for (const [name, ms] of cov.durations) durations.set(name, ms);
 
-    const tasks = buildPoolTasks({
-      afterSchema,
-      priorById,
-      uncovered: cov.uncovered,
-      durations,
-      runCov,
-      mode,
-      record,
-    });
-    if (tasks.length === 0) {
-      return {
-        run: rows.length,
-        heldBefore,
-        unrun: 0,
-        refused: null,
-        staleWarnings,
-        schemataEncoded,
-        rows,
-      };
-    }
-
-    const byId = new Map(afterSchema.map(({ item }) => [item.mutant.id, item] as const));
-    const { refused, unrun } = await runLocalPool({
-      workers: workers.slice(0, Math.min(workers.length, tasks.length)),
-      tasks,
-      suites: allSuites,
-      originals,
-      durations,
-      covered: cov.covered,
-      localQualified,
-      stopAtKill,
-      seconds,
-      deadline,
-      onResult: (task, raw) => {
-        const item = byId.get(task.plan.mutant.id);
-        if (item !== undefined) {
-          record(item, finalizeRow(item.suites, priorById.get(item.mutant.id), raw, mode));
-        }
-      },
-      progress,
-    });
+  const tasks = buildPoolTasks({
+    afterSchema,
+    priorById,
+    uncovered: cov.uncovered,
+    durations,
+    runCov,
+    mode,
+    record,
+  });
+  if (tasks.length === 0) {
     return {
       run: rows.length,
       heldBefore,
-      unrun,
-      refused,
+      unrun: 0,
+      refused: null,
       staleWarnings,
       schemataEncoded,
       rows,
     };
-  } finally {
-    if (ephemeralRoot !== null) rmSync(ephemeralRoot, { recursive: true, force: true });
   }
+
+  const mutantsByFile = new Map<string, Mutant[]>();
+  for (const { item } of afterSchema) {
+    const list = mutantsByFile.get(item.mutant.file) ?? [];
+    list.push(item.mutant);
+    mutantsByFile.set(item.mutant.file, list);
+  }
+  const byId = new Map(afterSchema.map(({ item }) => [item.mutant.id, item] as const));
+  const { refused, unrun } = await runLocalPool({
+    root: opts.root,
+    workers: workers.slice(0, Math.min(workers.length, tasks.length)),
+    tasks,
+    suites: allSuites,
+    originals,
+    mutantsByFile,
+    helperFiles,
+    durations,
+    uncovered: cov.uncovered,
+    covered: cov.covered,
+    localQualified,
+    prune,
+    stopAtKill,
+    seconds,
+    deadline,
+    onResult: (task, raw) => {
+      const item = byId.get(task.plan.mutant.id);
+      if (item !== undefined) {
+        record(item, finalizeRow(item.suites, priorById.get(item.mutant.id), raw, mode));
+      }
+    },
+    progress,
+  });
+  return {
+    run: rows.length,
+    heldBefore,
+    unrun,
+    refused,
+    staleWarnings,
+    schemataEncoded,
+    rows,
+  };
 }

@@ -45,10 +45,10 @@ Options:
   -j, --jobs, --concurrency <n>  Parallel worker count (default: min(8, CPU cores))
   --timeout <s>            Per-mutant/suite wall timeout cap in seconds (default: 300)
   --all                    Run every suite even after a kill (default stops at first kill)
-  --no-prune               Disable Mode-1 schemata and Mode-2 LCOV pruning
-  --no-schemata            Disable Mode-1 in-process schemata (force process-isolated pool)
+  --no-prune               Disable in-process schemata and LCOV coverage pruning
+  --no-schemata            Disable in-process schemata (run every suite in isolated clones)
   --cov-cache <dir>        Cache baseline suite durations and LCOV coverage
-  --clones <prefix>        Reusable directory prefix for Mode-2 clones
+  --clones <prefix>        Reusable directory prefix for isolated clones
   --depth <n|all>          Import-hop depth for test selection (default: 1 with transitive fallback)
   --until <ISO|HH:MM>      Stop starting new mutants after deadline
   --old <suite>            (report) Compare a baseline suite against newer suites

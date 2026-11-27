@@ -270,6 +270,63 @@ describe("Mode 2 process-isolated pool and execution invariants", () => {
     }
   });
 
+  it("prunes unreached mutants in subprocess suites via source-instrumented reachability while keeping reached kills", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "bm-subtrace-"));
+    try {
+      mkdirSync(join(dir, "src"), { recursive: true });
+      mkdirSync(join(dir, "test"), { recursive: true });
+      writeFileSync(
+        join(dir, "src", "cli-two.ts"),
+        [
+          "export function used(x: number): number { return x > 10 ? x + 1 : x - 1; }",
+          "export function dead(x: number): number { return x < 0 ? x + 5 : x - 5; }",
+          'if (import.meta.main) console.log(String(used(Number(Bun.argv[2] ?? "0"))));',
+        ].join("\n") + "\n",
+      );
+      writeFileSync(
+        join(dir, "test", "cli-two.test.ts"),
+        [
+          'import { expect, it } from "bun:test";',
+          'import { join } from "node:path";',
+          "const target = join(import.meta.dir, '..', 'src', 'cli-two.ts');",
+          'it("exercises used() via child process only", () => {',
+          '  const a = Bun.spawnSync([process.execPath, target, "11"], { stdout: "pipe" });',
+          '  const b = Bun.spawnSync([process.execPath, target, "10"], { stdout: "pipe" });',
+          '  expect(new TextDecoder().decode(a.stdout).trim()).toBe("12");',
+          '  expect(new TextDecoder().decode(b.stdout).trim()).toBe("9");',
+          "});",
+        ].join("\n") + "\n",
+      );
+
+      const suites = { cli: ["test/cli-two.test.ts"] };
+      const pruned = await runMutationSpecs({
+        root: dir,
+        specs: [{ file: "src/cli-two.ts", out: join(dir, "pruned.jsonl"), suites }],
+        prune: true,
+        concurrency: 2,
+      });
+      const unpruned = await runMutationSpecs({
+        root: dir,
+        specs: [{ file: "src/cli-two.ts", out: join(dir, "unpruned.jsonl"), suites }],
+        prune: false,
+        concurrency: 2,
+      });
+      expect(pruned.refused).toBeNull();
+      expect(unpruned.refused).toBeNull();
+      const mapP = new Map(pruned.rows.map((r) => [r.id, verdictOf(r.killed)]));
+      const mapU = new Map(unpruned.rows.map((r) => [r.id, verdictOf(r.killed)]));
+      expect(mapP.size).toBe(mapU.size);
+      for (const [id, v] of mapU) {
+        expect(mapP.get(id), `subprocess trace parity mismatch for ${id}`).toBe(v);
+      }
+      // Line 1 (`used`) mutants are killed, line 2 (`dead`) mutants survive
+      expect(pruned.rows.filter((r) => r.line === 1).every((r) => verdictOf(r.killed) === "killed")).toBe(true);
+      expect(pruned.rows.filter((r) => r.line === 2).every((r) => verdictOf(r.killed) === "survived")).toBe(true);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it("detects subprocess calls inside imported test helpers so hybrid suites are not LCOV-pruned", async () => {
     const dir = mkdtempSync(join(tmpdir(), "bm-helper-sub-"));
     try {
