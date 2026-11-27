@@ -54,6 +54,29 @@ export function combinedTimeoutSeconds(
   return Math.min(capSeconds, Math.max(15, Math.ceil((totalMs / 1000) * 10) + 10));
 }
 
+export function chunkSuites(
+  names: readonly string[],
+  durations: ReadonlyMap<string, number>,
+  capSeconds: number,
+): string[][] {
+  const budgetMs = Math.max(10_000, Math.floor((capSeconds * 1000) / 3));
+  const chunks: string[][] = [];
+  let cur: string[] = [];
+  let ms = 0;
+  for (const name of names) {
+    const dur = durations.get(name) ?? 4000;
+    if (cur.length > 0 && (ms + dur > budgetMs || cur.length >= 10)) {
+      chunks.push(cur);
+      cur = [];
+      ms = 0;
+    }
+    cur.push(name);
+    ms += dur;
+  }
+  if (cur.length > 0) chunks.push(cur);
+  return chunks;
+}
+
 export function canCombineSuites(
   active: readonly string[],
   suites: ReadonlyMap<string, readonly string[]>,
@@ -209,6 +232,73 @@ function replaceFile(path: string, contents: string): void {
   writeFileSync(path, contents);
 }
 
+async function runCombinedWaves(
+  seat: LocalWorker,
+  mutant: Mutant,
+  liveRest: readonly string[],
+  seed: VerdictMap,
+  opts: {
+    readonly suites: ReadonlyMap<string, readonly string[]>;
+    readonly durations: ReadonlyMap<string, number>;
+    readonly stopAtKill: boolean;
+    readonly seconds: number;
+    readonly localConc: number;
+    readonly activeProcs?: Set<KillableProc>;
+  },
+): Promise<KillOutcome> {
+  const out: VerdictMap = { ...seed };
+  for (const wave of chunkSuites(liveRest, opts.durations, opts.seconds)) {
+    if (wave.length === 1) {
+      const solo = await runSoloRest(seat, mutant, wave, {}, opts);
+      if (solo.kind !== "ok") return solo;
+      Object.assign(out, solo.killed);
+      if (Object.values(solo.killed).some(Boolean)) break;
+      continue;
+    }
+    const paths = wave.flatMap((name) => opts.suites.get(name) ?? []);
+    const batch = parseMultiFileBail(
+      wave,
+      opts.suites,
+      await spawnTest(
+        seat.clone,
+        paths,
+        combinedTimeoutSeconds(opts.seconds, wave, opts.durations),
+        opts.localConc,
+        opts.activeProcs,
+      ),
+    );
+    const blamed = wave.find((name) => batch[name] === true);
+    if (blamed !== undefined) {
+      const solo = await verdict(
+        seat.clone,
+        opts.suites.get(blamed) ?? [],
+        suiteTimeoutSeconds(opts.seconds, opts.durations.get(blamed)),
+        opts.localConc,
+        opts.activeProcs,
+      );
+      if (solo === true) {
+        Object.assign(out, batch);
+        break;
+      }
+      const fallback = await runSoloRest(seat, mutant, wave, { [blamed]: solo }, opts);
+      if (fallback.kind !== "ok") return fallback;
+      Object.assign(out, fallback.killed);
+      if (Object.values(fallback.killed).some(Boolean)) break;
+      continue;
+    }
+    if (wave.some((name) => batch[name] === null)) {
+      const fallback = await runSoloRest(seat, mutant, wave, batch, opts);
+      if (fallback.kind !== "ok") return fallback;
+      Object.assign(out, fallback.killed);
+      if (Object.values(fallback.killed).some(Boolean)) break;
+      continue;
+    }
+    Object.assign(out, batch);
+  }
+  for (const name of liveRest) if (!(name in out)) out[name] = null;
+  return { kind: "ok", killed: out };
+}
+
 export async function killsOf(
   seat: LocalWorker,
   plan: BatchPlan,
@@ -274,58 +364,8 @@ export async function killsOf(
       if (liveRest.length === 0) {
         return { kind: "ok", killed: { [lead]: leadSaid, ...prunedRest } };
       }
-      if (liveRest.length === 1) {
-        const fallback = await runSoloRest(seat, mutant, liveRest, prunedRest, {
-          ...opts,
-          beforeSuite: undefined,
-        });
-        return fallback.kind === "ok"
-          ? { kind: "ok", killed: { [lead]: leadSaid, ...fallback.killed } }
-          : fallback;
-      }
-      const paths = liveRest.flatMap((name) => opts.suites.get(name) ?? []);
-      const batch = parseMultiFileBail(
-        liveRest,
-        opts.suites,
-        await spawnTest(
-          seat.clone,
-          paths,
-          combinedTimeoutSeconds(opts.seconds, liveRest, opts.durations),
-          opts.localConc,
-          opts.activeProcs,
-        ),
-      );
-      const blamed = liveRest.find((name) => batch[name] === true);
-      if (blamed !== undefined) {
-        const solo = await verdict(
-          seat.clone,
-          opts.suites.get(blamed) ?? [],
-          suiteTimeoutSeconds(opts.seconds, opts.durations.get(blamed)),
-          opts.localConc,
-          opts.activeProcs,
-        );
-        if (solo === true) return { kind: "ok", killed: { [lead]: leadSaid, ...prunedRest, ...batch } };
-        const fallback = await runSoloRest(
-          seat,
-          mutant,
-          liveRest,
-          { ...prunedRest, [blamed]: solo },
-          { ...opts, beforeSuite: undefined },
-        );
-        return fallback.kind === "ok"
-          ? { kind: "ok", killed: { [lead]: leadSaid, ...fallback.killed } }
-          : fallback;
-      }
-      if (liveRest.some((name) => batch[name] === null)) {
-        const fallback = await runSoloRest(seat, mutant, liveRest, { ...prunedRest, ...batch }, {
-          ...opts,
-          beforeSuite: undefined,
-        });
-        return fallback.kind === "ok"
-          ? { kind: "ok", killed: { [lead]: leadSaid, ...fallback.killed } }
-          : fallback;
-      }
-      return { kind: "ok", killed: { [lead]: leadSaid, ...prunedRest, ...batch } };
+      const waves = await runCombinedWaves(seat, mutant, liveRest, prunedRest, opts);
+      return waves.kind === "ok" ? { kind: "ok", killed: { [lead]: leadSaid, ...waves.killed } } : waves;
     }
     return await runSoloRest(seat, mutant, active, {}, {
       ...opts,
@@ -343,15 +383,21 @@ export async function qualifySuites(
   seconds: number,
   localConc: number,
 ): Promise<string | null> {
+  const names = [...suites.keys()];
   const all = [...new Set([...suites.values()].flat())];
   if (all.length === 0) return "no suites given";
-  if (suites.size > 1 && (await verdict(worker.clone, all, seconds, localConc)) === false) return null;
-  for (const [name, paths] of suites) {
-    const said = await verdict(worker.clone, paths, seconds, localConc);
-    if (said === false) continue;
-    return `baseline suite "${name}" did not pass unmutated (${said === true ? "failed" : "no verdict"})`;
-  }
-  return null;
+  const conc = Math.max(1, localConc);
+  const timeoutFor = (count: number) => Math.min(600, Math.max(seconds, Math.ceil(count / conc) * 30));
+  const findBad = async (group: readonly string[]): Promise<string | null> => {
+    const paths = [...new Set(group.flatMap((name) => suites.get(name) ?? []))];
+    if (paths.length === 0) return null;
+    const said = await verdict(worker.clone, paths, timeoutFor(paths.length), localConc);
+    if (said === false) return null;
+    if (group.length === 1) return refusalFor(group[0]!, said);
+    const mid = Math.floor(group.length / 2);
+    return (await findBad(group.slice(0, mid))) ?? (await findBad(group.slice(mid)));
+  };
+  return findBad(names);
 }
 
 export interface LazyQualificationResult {

@@ -2,7 +2,7 @@ import { describe, expect, it } from "bun:test";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, relative } from "node:path";
-import { linkModules } from "../src/exec.ts";
+import { chunkSuites, linkModules } from "../src/exec.ts";
 import {
   measureCoverage,
   parseMultiFileBail,
@@ -477,5 +477,33 @@ describe("Mode 2 process-isolated pool and execution invariants", () => {
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
+  });
+
+  it("chunks combined rest suites by duration budget and count cap so large suite sets do not overflow combined timeouts", () => {
+    const durations = new Map<string, number>([
+      ["s1", 6000],
+      ["s2", 6000],
+      ["s3", 6000],
+      ["s4", 15_000],
+      ["s5", 2000],
+    ]);
+    // capSeconds = 30 -> budgetMs = 10_000: [s1], [s2], [s3], [s4], [s5]
+    expect(chunkSuites(["s1", "s2", "s3", "s4", "s5"], durations, 30)).toEqual([
+      ["s1"],
+      ["s2"],
+      ["s3"],
+      ["s4"],
+      ["s5"],
+    ]);
+    // capSeconds = 60 -> budgetMs = 20_000: [s1, s2, s3] (18s), [s4, s5] (17s)
+    expect(chunkSuites(["s1", "s2", "s3", "s4", "s5"], durations, 60)).toEqual([
+      ["s1", "s2", "s3"],
+      ["s4", "s5"],
+    ]);
+    // Count cap of 10 splits fast suites even when under duration budget
+    const twelve = Array.from({ length: 12 }, (_, i) => `f${String(i)}`);
+    const fastDurs = new Map(twelve.map((name) => [name, 100]));
+    const waves = chunkSuites(twelve, fastDurs, 120);
+    expect(waves.map((w) => w.length)).toEqual([10, 2]);
   });
 });
