@@ -3,6 +3,21 @@
   "version": "0.1.0",
   "description": "Fast, zero-config mutation testing for Bun and TypeScript with in-process mutant schemata and process-isolated fallback",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/s-smits/bun-mutate.git"
+  },
+  "homepage": "https://github.com/s-smits/bun-mutate#readme",
+  "bugs": {
+    "url": "https://github.com/s-smits/bun-mutate/issues"
+  },
+  "keywords": [
+    "bun",
+    "typescript",
+    "mutation-testing",
+    "mutant-schemata",
+    "testing"
+  ],
   "type": "module",
   "bin": {
     "bun-mutate": "./src/cli.ts"
