@@ -558,13 +558,14 @@ export async function cloneTree(root: string, dest: string): Promise<void> {
 }
 
 export function linkModules(root: string, clone: string): void {
-  const rootModules = join(root, "node_modules");
+  const absRoot = resolve(root);
+  const rootModules = join(absRoot, "node_modules");
   const cloneModules = join(clone, "node_modules");
   if (existsSync(rootModules) && !existsSync(cloneModules)) {
     symlinkSync(rootModules, cloneModules);
   }
   for (const wsDir of ["packages", "apps"]) {
-    const absWs = join(root, wsDir);
+    const absWs = join(absRoot, wsDir);
     if (!existsSync(absWs)) continue;
     try {
       for (const entry of readdirSync(absWs, { withFileTypes: true })) {

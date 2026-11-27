@@ -1,7 +1,8 @@
 import { describe, expect, it } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, relative } from "node:path";
+import { linkModules } from "../src/exec.ts";
 import {
   measureCoverage,
   parseMultiFileBail,
@@ -456,6 +457,23 @@ describe("Mode 2 process-isolated pool and execution invariants", () => {
       });
       expect(lazy.refused).toContain(`baseline suite "${weirdSuite}"`);
       expect(lazy.unrun).toBeGreaterThan(0);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("resolves relative root paths in linkModules so clones never create self-referential node_modules symlinks", () => {
+    const dir = mkdtempSync(join(tmpdir(), "bm-rel-link-"));
+    try {
+      const repo = join(dir, "repo");
+      const clone = join(dir, "clone");
+      mkdirSync(join(repo, "node_modules", "pkg"), { recursive: true });
+      writeFileSync(join(repo, "node_modules", "pkg", "index.js"), "export const ok = 1;\n");
+      mkdirSync(clone, { recursive: true });
+      const relRoot = relative(process.cwd(), repo);
+      linkModules(relRoot, clone);
+      expect(realpathSync(join(clone, "node_modules"))).toBe(realpathSync(join(repo, "node_modules")));
+      expect(existsSync(join(clone, "node_modules", "pkg", "index.js"))).toBe(true);
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
