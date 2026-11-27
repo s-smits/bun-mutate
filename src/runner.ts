@@ -353,29 +353,34 @@ export async function runMutationSpecs(opts: RunOptions): Promise<RunSummary> {
           );
         }
       };
-      const smallFiles = entries.filter(([, items]) => items.length <= 24);
-      const largeFiles = entries.filter(([, items]) => items.length > 24);
-      if (smallFiles.length > 0) {
-        const queue = [...smallFiles];
-        const width = Math.min(concurrency, queue.length);
-        const perFileConc = Math.max(1, Math.floor(concurrency / width));
-        await Promise.all(
-          Array.from({ length: width }, async (_, workerIdx) => {
-            const sliceSandboxes = async (): Promise<readonly string[]> => {
-              const all = await ensureSandboxes();
-              const start = workerIdx * perFileConc;
-              const slice = all.slice(start, start + perFileConc);
-              return slice.length > 0 ? slice : all.slice(workerIdx % all.length, (workerIdx % all.length) + 1);
-            };
-            for (let next = queue.shift(); next !== undefined; next = queue.shift()) {
-              await runOneFile(next[0], next[1], perFileConc, sliceSandboxes);
-            }
-          }),
-        );
+      // Dynamic slot-pool scheduler: sort largest-first (LPT) and allocate up to `ceil(mutants / 16)`
+      // disjoint sandbox slots per file with no small/large barrier, so one slow file never stalls idle cores.
+      const queue = entries.toSorted((a, b) => b[1].length - a[1].length);
+      const freeSlots = Array.from({ length: concurrency }, (_, idx) => idx);
+      const waiters: (() => void)[] = [];
+      const acquire = async (want: number): Promise<number[]> => {
+        while (freeSlots.length === 0) {
+          await new Promise<void>((resolve) => waiters.push(resolve));
+        }
+        return freeSlots.splice(0, Math.min(want, freeSlots.length));
+      };
+      const release = (slots: readonly number[]) => {
+        freeSlots.push(...slots);
+        while (waiters.length > 0 && freeSlots.length > 0) waiters.shift()?.();
+      };
+      const running: Promise<void>[] = [];
+      for (const [file, items] of queue) {
+        if (Date.now() >= deadline) break;
+        const want = Math.min(concurrency, Math.max(1, Math.ceil(items.length / 16)));
+        const slots = await acquire(want);
+        const sliceSandboxes = async (): Promise<readonly string[]> => {
+          const all = await ensureSandboxes();
+          return slots.map((idx) => all[idx]).filter((dir): dir is string => dir !== undefined);
+        };
+        const job = runOneFile(file, items, slots.length, sliceSandboxes).finally(() => release(slots));
+        running.push(job);
       }
-      for (const [file, items] of largeFiles) {
-        await runOneFile(file, items, concurrency);
-      }
+      await Promise.all(running);
       if (schemataEncoded > 0 && durations.size > 0) {
         const sec = ((Date.now() - schemataStart) / 1000).toFixed(1);
         const after = splitAfterSchema(todo, priorById, mode, record);
