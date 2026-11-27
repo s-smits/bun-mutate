@@ -402,7 +402,7 @@ async function handleRun(
   });
   const elapsedSec = ((Date.now() - started) / 1000).toFixed(1);
 
-  if (summary.refused !== null) {
+  if (summary.refused !== null && summary.run === 0) {
     console.error(summary.refused);
     return 1;
   }
@@ -440,6 +440,7 @@ async function handleRun(
           run: summary.run,
           heldBefore: summary.heldBefore,
           unrun: summary.unrun,
+          refused: summary.refused,
           killed: report.killed,
           survived: report.survived,
           unread: report.unread,
@@ -463,6 +464,11 @@ async function handleRun(
     for (const [file, count] of untested) {
       console.error(`no nearby test: ${file} (${String(count)} mutants)`);
     }
+  }
+
+  if (summary.refused !== null) {
+    console.error(summary.refused);
+    return 1;
   }
 
   if (summary.unrun > 0) {

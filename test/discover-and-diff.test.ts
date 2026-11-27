@@ -7,9 +7,11 @@ import {
   changedLinesInDiff,
   cloneTree,
   detectDefaultBase,
+  diffChangedLines,
   discoverSourceFiles,
   discoverSourceRoots,
   discoverTestFiles,
+  resolveDiffRef,
   rowsOf,
   verdictOf,
 } from "../src/index.ts";
@@ -233,7 +235,7 @@ describe("git diff parsing and zero-flag diff-hunk mode", () => {
     expect([...(map.get("src/a.ts") ?? [])]).toEqual([6, 7, 22]);
   });
 
-  it("auto-detects default base branch and mutates only changed lines via `bun-mutate diff`", () => {
+  it("auto-detects default base branch and mutates only changed lines via `bun-mutate diff`", async () => {
     const dir = mkdtempSync(join(tmpdir(), "bm-diff-e2e-"));
     try {
       runGit(dir, "init", "-b", "main");
@@ -313,6 +315,96 @@ describe("git diff parsing and zero-flag diff-hunk mode", () => {
       expect(rows.every((r) => r.line === 5)).toBe(true);
       expect(rows.every((r) => verdictOf(r.killed) === "killed")).toBe(true);
       expect(readFileSync(join(outDir, "report.md"), "utf8")).toContain("2 killed, 0 survived");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects option-like git refs, replicates refs across files and reftable clones, and bridges facade/barrel tests", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "bm-git-and-facade-"));
+    try {
+      mkdirSync(join(dir, "src", "feature"), { recursive: true });
+      mkdirSync(join(dir, "src", "other"), { recursive: true });
+      mkdirSync(join(dir, "test"), { recursive: true });
+      runGit(dir, "init", "-q", "-b", "main");
+      runGit(dir, "config", "user.email", "test@example.com");
+      runGit(dir, "config", "user.name", "Test");
+      writeFileSync(join(dir, "src", "feature", "helper.ts"), "export const h = (x: number) => x > 0;\n");
+      writeFileSync(
+        join(dir, "src", "feature", "entry.ts"),
+        'import { h } from "./helper.ts";\nexport const run = (x: number) => h(x);\n',
+      );
+      writeFileSync(
+        join(dir, "src", "other", "consumer.ts"),
+        'import { h } from "../feature/helper.ts";\nexport const c = (x: number) => h(x);\n',
+      );
+      writeFileSync(
+        join(dir, "test", "feature-direct.test.ts"),
+        'import { h } from "../src/feature/helper.ts";\nvoid h;\n',
+      );
+      writeFileSync(
+        join(dir, "test", "feature-entry.test.ts"),
+        'import { run } from "../src/feature/entry.ts";\nvoid run;\n',
+      );
+      writeFileSync(
+        join(dir, "test", "other-consumer.test.ts"),
+        'import { c } from "../src/other/consumer.ts";\nvoid c;\n',
+      );
+      runGit(dir, "add", ".");
+      runGit(dir, "commit", "-m", "initial");
+
+      // Option-like refs must be rejected without writing to the flag path
+      const evilFile = join(dir, "evil-output.txt");
+      expect(resolveDiffRef(dir, `--output=${evilFile}`)).toBeNull();
+      expect(diffChangedLines(dir, `--output=${evilFile}`)).toBeNull();
+      expect(existsSync(evilFile)).toBe(false);
+
+      // cloneTree preserves branch/remote refs and skips stale .bun-mutate* dirs
+      const baseSha = new TextDecoder()
+        .decode(Bun.spawnSync(["git", "-C", dir, "rev-parse", "main"]).stdout)
+        .trim();
+      runGit(dir, "update-ref", "refs/remotes/origin/main", baseSha);
+      mkdirSync(join(dir, ".bun-mutate-old"), { recursive: true });
+      writeFileSync(join(dir, ".bun-mutate-old", "stale.txt"), "stale\n");
+      const cloneDir = join(dir, ".clone-check");
+      await cloneTree(dir, cloneDir);
+      expect(existsSync(join(cloneDir, ".bun-mutate-old"))).toBe(false);
+      const cloneRef = new TextDecoder()
+        .decode(Bun.spawnSync(["git", "-C", cloneDir, "rev-parse", "origin/main"]).stdout)
+        .trim();
+      expect(cloneRef).toBe(baseSha);
+
+      // Reftable repositories clone cleanly without failing on refs/heads placeholder files
+      const reftableDir = join(dir, "reftable-repo");
+      mkdirSync(reftableDir, { recursive: true });
+      const reftableInit = Bun.spawnSync(["git", "-C", reftableDir, "init", "-q", "--ref-format=reftable", "-b", "main"], {
+        stdout: "pipe",
+        stderr: "pipe",
+      });
+      if (reftableInit.exitCode === 0) {
+        runGit(reftableDir, "config", "user.email", "test@example.com");
+        runGit(reftableDir, "config", "user.name", "Test");
+        writeFileSync(join(reftableDir, "a.ts"), "export const a = 1;\n");
+        runGit(reftableDir, "add", ".");
+        runGit(reftableDir, "commit", "-m", "reftable init");
+        const rtSha = new TextDecoder()
+          .decode(Bun.spawnSync(["git", "-C", reftableDir, "rev-parse", "main"]).stdout)
+          .trim();
+        runGit(reftableDir, "update-ref", "refs/remotes/origin/main", rtSha);
+        const rtClone = join(dir, "reftable-clone");
+        await cloneTree(reftableDir, rtClone);
+        const rtCloneRef = new TextDecoder()
+          .decode(Bun.spawnSync(["git", "-C", rtClone, "rev-parse", "origin/main"]).stdout)
+          .trim();
+        expect(rtCloneRef).toBe(rtSha);
+      }
+
+      // Depth-1 discovery bridges through same-directory facades without fan-out to unrelated compartments
+      const idx = buildTestIndex(dir, { depth: 1 });
+      expect(idx.suitesFor("src/feature/helper.ts")).toEqual([
+        "test/feature-direct.test.ts",
+        "test/feature-entry.test.ts",
+      ]);
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }

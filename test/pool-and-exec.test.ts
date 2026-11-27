@@ -387,4 +387,77 @@ describe("Mode 2 process-isolated pool and execution invariants", () => {
       rmSync(dir, { recursive: true, force: true });
     }
   });
+
+  it("isolates a baseline-failing suite so healthy files still complete while surfacing the exact refusal", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "bm-per-suite-refusal-"));
+    try {
+      mkdirSync(join(dir, "src"), { recursive: true });
+      mkdirSync(join(dir, "test"), { recursive: true });
+      writeFileSync(join(dir, "src", "good.ts"), "export const above = (n: number) => n > 0;\n");
+      writeFileSync(join(dir, "src", "bad.ts"), "export const below = (n: number) => n < 0;\n");
+      writeFileSync(
+        join(dir, "test", "good.test.ts"),
+        'import { expect, it } from "bun:test";\nimport { above } from "../src/good.ts";\nit("checks bound", () => expect([above(0), above(1)]).toEqual([false, true]));\n',
+      );
+      writeFileSync(
+        join(dir, "test", "bad.test.ts"),
+        'import { expect, it } from "bun:test";\nimport { below } from "../src/bad.ts";\nit("always fails baseline", () => expect(below(1)).toBe(true));\n',
+      );
+      const warnings: string[] = [];
+      const res = await runMutationSpecs({
+        root: dir,
+        specs: [
+          {
+            file: "src/good.ts",
+            out: join(dir, "good.jsonl"),
+            suites: { good: ["test/good.test.ts"] },
+          },
+          {
+            file: "src/bad.ts",
+            out: join(dir, "bad.jsonl"),
+            suites: { bad: ["test/bad.test.ts"] },
+          },
+        ],
+        prune: true,
+        schemata: false,
+        warn: (msg) => warnings.push(msg),
+      });
+      expect(res.refused).toContain('baseline suite "bad"');
+      expect(res.unrun).toBeGreaterThan(0);
+      expect(warnings.some((msg) => msg.includes('skipping suite "bad"'))).toBe(true);
+      const goodRows = rowsOf(join(dir, "good.jsonl"));
+      expect(goodRows.length).toBeGreaterThan(0);
+      expect(goodRows.every((r) => verdictOf(r.killed) === "killed")).toBe(true);
+      expect(rowsOf(join(dir, "bad.jsonl"))).toEqual([]);
+
+      // Lazy secondary-suite refusal with a quoted suite name must terminate cleanly without spin-looping
+      const weirdSuite = 'we"ird';
+      writeFileSync(join(dir, "src", "lazy.ts"), "export const keep = (n: number) => n > 1;\n");
+      writeFileSync(
+        join(dir, "test", "pass-weak.test.ts"),
+        'import { expect, it } from "bun:test";\nimport { keep } from "../src/lazy.ts";\nit("passes without killing", () => expect(typeof keep).toBe("function"));\n',
+      );
+      const lazy = await runMutationSpecs({
+        root: dir,
+        specs: [
+          {
+            file: "src/lazy.ts",
+            out: join(dir, "lazy.jsonl"),
+            suites: {
+              lead: ["test/pass-weak.test.ts"],
+              [weirdSuite]: ["test/bad.test.ts"],
+            },
+          },
+        ],
+        prune: false,
+        schemata: false,
+        stopAtKill: true,
+        deadlineMs: Date.now() + 15_000,
+      });
+      expect(lazy.refused).toContain(`baseline suite "${weirdSuite}"`);
+      expect(lazy.unrun).toBeGreaterThan(0);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
 });

@@ -29,9 +29,11 @@ export function detectDefaultBase(repo: string): string | null {
 
 export function resolveDiffRef(repo: string, explicitRef: string | null): string | null {
   const ref = explicitRef ?? detectDefaultBase(repo);
-  if (ref === null) return null;
+  if (ref === null || ref.startsWith("-")) return null;
   if (ref.includes("..")) return ref;
-  if (gitMaybe(repo, "rev-parse", "--verify", "--quiet", ref) === null) return null;
+  if (gitMaybe(repo, "rev-parse", "--verify", "--quiet", `${ref}^{commit}`) === null) {
+    return null;
+  }
   const mergeBase = gitMaybe(repo, "merge-base", ref, "HEAD");
   return mergeBase ?? ref;
 }
@@ -91,6 +93,7 @@ export function diffChangedLines(
   ref: string,
   paths?: readonly string[],
 ): Map<string, Set<number>> | null {
+  if (ref.startsWith("-")) return null;
   const diffArgs = [
     "-c",
     "core.quotePath=false",

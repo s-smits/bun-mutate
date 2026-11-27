@@ -1,5 +1,5 @@
 import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
-import { dirname, isAbsolute, join, relative, resolve } from "node:path";
+import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
 import * as ts from "typescript";
 import { gitRaw } from "./git.ts";
 
@@ -556,11 +556,25 @@ export function buildTestIndex(
       return statSync(join(root, a)).size - statSync(join(root, b)).size;
     };
 
+  const isFacadeBridge = (mid: string, owner: string): boolean =>
+    toPosix(dirname(mid)) === toPosix(dirname(owner)) ||
+    /^index\.[cm]?[jt]sx?$/u.test(basename(mid)) ||
+    TEST_HELPER_RE.test(mid);
+
   const suitesFor = (ownerRaw: string): string[] => {
     const owner = toPosix(ownerRaw);
-    let matched = tests.filter(
-      (path) => reachable.get(path)?.has(owner) === true || pathMentioned(transformed.get(path) ?? "", owner),
-    );
+    let matched = tests.filter((path) => {
+      if (reachable.get(path)?.has(owner) === true || pathMentioned(transformed.get(path) ?? "", owner)) {
+        return true;
+      }
+      if (depth !== 1) return false;
+      const hops = direct.get(path);
+      if (hops === undefined) return false;
+      for (const mid of hops) {
+        if (isFacadeBridge(mid, owner) && importsOf(mid).includes(owner)) return true;
+      }
+      return false;
+    });
     if (matched.length === 0 && depth < Number.POSITIVE_INFINITY) {
       transitive ??= reachAt(Number.POSITIVE_INFINITY);
       matched = tests.filter((path) => transitive?.get(path)?.has(owner) === true);

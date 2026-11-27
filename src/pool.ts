@@ -58,6 +58,7 @@ export async function runLocalPool(opts: {
   readonly seconds: number;
   readonly deadline: number;
   readonly onResult: (task: PoolTask, killed: VerdictMap) => void;
+  readonly warn?: (message: string) => void;
   readonly progress?: (message: string) => void;
 }): Promise<{ readonly refused: string | null; readonly unrun: number }> {
   const pending = [...opts.tasks].toSorted((a, b) => b.weightMs - a.weightMs);
@@ -70,6 +71,15 @@ export async function runLocalPool(opts: {
   const localCount = opts.workers.length;
   const baseConc = Math.min(4, Math.max(1, Math.floor(cores / Math.max(1, localCount))));
   const qualifyWait = new Map<string, Promise<string | null>>();
+  const badSuites = new Set<string>();
+  const skippedSuites = new Map<string, string>();
+  const markBadSuite = (name: string, why: string) => {
+    badSuites.add(name);
+    if (!skippedSuites.has(name)) {
+      skippedSuites.set(name, why);
+      opts.warn?.(`${why}; skipping suite "${name}"`);
+    }
+  };
 
   const isPruned = (suite: string, mutant: Mutant): boolean => {
     if (!opts.prune) return false;
@@ -162,30 +172,35 @@ export async function runLocalPool(opts: {
   );
   if (opts.workers.length > 0 && initialSuites.length > 0 && Date.now() < opts.deadline) {
     const queue = [...initialSuites];
-    let firstRefusal: string | null = null;
     const runners = opts.workers.slice(0, Math.min(opts.workers.length, queue.length));
     await Promise.all(
       runners.map(async (worker) => {
         for (;;) {
-          if (firstRefusal !== null || Date.now() >= opts.deadline) return;
+          if (Date.now() >= opts.deadline) return;
           const name = queue.shift();
           if (name === undefined) return;
           const why = await ensureQualified(worker, [name]);
-          if (why !== null) {
-            firstRefusal ??= why;
-            return;
-          }
+          if (why !== null) markBadSuite(name, why);
         }
       }),
     );
-    if (firstRefusal !== null) {
-      return { refused: firstRefusal, unrun: opts.tasks.length };
+    const hasRunnable = pending.some((task) => !task.plan.active.some((name) => badSuites.has(name)));
+    if (!hasRunnable && skippedSuites.size > 0) {
+      return { refused: [...new Set(skippedSuites.values())].join("\n"), unrun: opts.tasks.length };
     }
   }
 
+  const pullRunnable = (): PoolTask | undefined => {
+    const idx = pending.findIndex(
+      (task) => !doneKeys.has(task.key) && !task.plan.active.some((name) => badSuites.has(name)),
+    );
+    if (idx === -1) return undefined;
+    return pending.splice(idx, 1)[0];
+  };
+
   const runSeat = async (seat: LocalWorker): Promise<void> => {
     while (!doneAll()) {
-      const task = pending.shift();
+      const task = pullRunnable();
       if (task === undefined) return;
       if (doneKeys.has(task.key)) continue;
       const liveActive = task.plan.active.filter((name) => !isPruned(name, task.plan.mutant));
@@ -203,7 +218,10 @@ export async function runLocalPool(opts: {
           opts.stopAtKill,
         );
         // Adaptive tail concurrency: 1 under full load -> up to 4 as remaining tasks drain.
-        const demand = Math.min(localCount, Math.max(1, pending.length + localInFlight));
+        const runnablePending = pending.filter(
+          (item) => !doneKeys.has(item.key) && !item.plan.active.some((name) => badSuites.has(name)),
+        ).length;
+        const demand = Math.min(localCount, Math.max(1, runnablePending + localInFlight));
         const localConc = Math.min(4, Math.max(1, Math.floor(cores / demand)));
         const outcome = await killsOf(seat, ordered, {
           originals: opts.originals,
@@ -217,8 +235,12 @@ export async function runLocalPool(opts: {
           isPruned,
         });
         if (outcome.kind === "refused") {
-          refused ??= outcome.why;
           if (!doneKeys.has(task.key)) pending.unshift(task);
+          if (outcome.suite !== undefined && task.plan.active.includes(outcome.suite)) {
+            markBadSuite(outcome.suite, outcome.why);
+            continue;
+          }
+          refused ??= outcome.why;
           resolveDone?.();
           return;
         }
@@ -233,5 +255,14 @@ export async function runLocalPool(opts: {
   await Promise.race([allWorkers, finished]);
   await settleProcs(activeProcs, 200);
   await Promise.race([allWorkers, Bun.sleep(150)]);
-  return { refused, unrun: opts.tasks.length - doneKeys.size };
+  const unrunTasks = opts.tasks.filter((task) => !doneKeys.has(task.key));
+  const reasons = new Set<string>(refused === null ? [] : [refused]);
+  for (const name of unrunTasks.flatMap((task) => task.plan.active)) {
+    const why = skippedSuites.get(name);
+    if (why !== undefined) reasons.add(why);
+  }
+  return {
+    refused: reasons.size === 0 ? null : [...reasons].join("\n"),
+    unrun: unrunTasks.length,
+  };
 }

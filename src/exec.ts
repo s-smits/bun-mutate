@@ -158,7 +158,7 @@ const refusalFor = (name: string, said: boolean | null): string =>
 
 export type KillOutcome =
   | { readonly kind: "ok"; readonly killed: VerdictMap }
-  | { readonly kind: "refused"; readonly why: string };
+  | { readonly kind: "refused"; readonly why: string; readonly suite?: string };
 
 async function runSoloRest(
   seat: LocalWorker,
@@ -185,7 +185,7 @@ async function runSoloRest(
     if (out[name] === false || out[name] === true) continue;
     if (opts.beforeSuite !== undefined) {
       const why = await opts.beforeSuite(name);
-      if (why !== null) return { kind: "refused", why };
+      if (why !== null) return { kind: "refused", why, suite: name };
     }
     if (opts.isPruned?.(name, mutant) === true) {
       out[name] = false;
@@ -229,12 +229,14 @@ export async function killsOf(
   const target = join(seat.clone, mutant.file);
   const writeMutant = () => replaceFile(target, applyMutant(original, mutant));
   const restore = () => replaceFile(target, original);
-  const qualifyClean = async (names: readonly string[]): Promise<string | null> => {
+  const qualifyClean = async (
+    names: readonly string[],
+  ): Promise<{ readonly suite: string; readonly why: string } | null> => {
     if (opts.beforeSuite === undefined) return null;
     restore();
     for (const name of names) {
       const why = await opts.beforeSuite(name);
-      if (why !== null) return why;
+      if (why !== null) return { suite: name, why };
     }
     writeMutant();
     return null;
@@ -243,8 +245,8 @@ export async function killsOf(
   try {
     const [lead, ...rest] = active;
     if (lead !== undefined && canCombineSuites(rest, opts.suites, opts.stopAtKill)) {
-      const leadWhy = await qualifyClean([lead]);
-      if (leadWhy !== null) return { kind: "refused", why: leadWhy };
+      const leadFail = await qualifyClean([lead]);
+      if (leadFail !== null) return { kind: "refused", why: leadFail.why, suite: leadFail.suite };
       const leadSaid =
         opts.isPruned?.(lead, mutant) === true
           ? false
@@ -261,8 +263,8 @@ export async function killsOf(
           killed: { [lead]: true, ...Object.fromEntries(rest.map((name) => [name, null] as const)) },
         };
       }
-      const restWhy = await qualifyClean(rest);
-      if (restWhy !== null) return { kind: "refused", why: restWhy };
+      const restFail = await qualifyClean(rest);
+      if (restFail !== null) return { kind: "refused", why: restFail.why, suite: restFail.suite };
       const prunedRest: VerdictMap = {};
       const liveRest: string[] = [];
       for (const name of rest) {
@@ -327,7 +329,8 @@ export async function killsOf(
     }
     return await runSoloRest(seat, mutant, active, {}, {
       ...opts,
-      beforeSuite: opts.beforeSuite === undefined ? undefined : (name) => qualifyClean([name]),
+      beforeSuite:
+        opts.beforeSuite === undefined ? undefined : (name) => qualifyClean([name]).then((fail) => fail?.why ?? null),
     });
   } finally {
     restore();
@@ -469,6 +472,8 @@ export async function qualifySuiteWithPruning(
 
 function cloneGitTree(absRoot: string, absDest: string, skipInsideRoot: string | null): boolean {
   if (gitMaybe(absRoot, "rev-parse", "--show-prefix") !== "") return false;
+  const objects = gitMaybe(absRoot, "rev-parse", "--path-format=absolute", "--git-path", "objects");
+  if (objects === null) return false;
   const listed = gitRaw(
     absRoot,
     "-c",
@@ -480,11 +485,30 @@ function cloneGitTree(absRoot: string, absDest: string, skipInsideRoot: string |
     "--exclude-standard",
   );
   if (listed === null) return false;
+  if (gitMaybe(absDest, "init", "-q") === null) return false;
+  mkdirSync(join(absDest, ".git", "objects", "info"), { recursive: true });
+  writeFileSync(join(absDest, ".git", "objects", "info", "alternates"), `${objects}\n`);
+  const head = gitMaybe(absRoot, "rev-parse", "-q", "--verify", "HEAD^{commit}");
+  if (head !== null) writeFileSync(join(absDest, ".git", "HEAD"), `${head}\n`);
+  const index = gitMaybe(absRoot, "rev-parse", "--path-format=absolute", "--git-path", "index");
+  if (index !== null && existsSync(index)) {
+    copyFileSync(index, join(absDest, ".git", "index"), constants.COPYFILE_FICLONE);
+  }
+  // Use `git for-each-ref` so refs replicate cleanly across both files and reftable backends without copying `.lock` files.
+  const refs = gitRaw(absRoot, "for-each-ref", "--format=%(objectname) %(refname)");
+  if (refs !== null && refs.length > 0) {
+    writeFileSync(join(absDest, ".git", "packed-refs"), `# pack-refs with: peeled fully-peeled sorted \n${refs}`);
+  }
+  const common = gitMaybe(absRoot, "rev-parse", "--path-format=absolute", "--git-common-dir");
+  if (common !== null) {
+    const shallow = join(common, "shallow");
+    if (existsSync(shallow)) copyFileSync(shallow, join(absDest, ".git", "shallow"), constants.COPYFILE_FICLONE);
+  }
   const made = new Set<string>();
   for (const rel of listed.split("\0")) {
     if (rel === "") continue;
     const top = rel.split("/")[0] ?? "";
-    if (CLONE_SKIP_DIRS.has(top) || top === skipInsideRoot) continue;
+    if (CLONE_SKIP_DIRS.has(top) || top.startsWith(".bun-mutate") || top === skipInsideRoot) continue;
     const src = join(absRoot, rel);
     let stat: ReturnType<typeof lstatSync>;
     try {
@@ -501,17 +525,6 @@ function cloneGitTree(absRoot: string, absDest: string, skipInsideRoot: string |
     if (stat.isSymbolicLink()) symlinkSync(readlinkSync(src), dst);
     else if (stat.isFile()) copyFileSync(src, dst, constants.COPYFILE_FICLONE);
   }
-  const objects = gitMaybe(absRoot, "rev-parse", "--path-format=absolute", "--git-path", "objects");
-  if (objects !== null && gitMaybe(absDest, "init", "-q") !== null) {
-    mkdirSync(join(absDest, ".git", "objects", "info"), { recursive: true });
-    writeFileSync(join(absDest, ".git", "objects", "info", "alternates"), `${objects}\n`);
-    const head = gitMaybe(absRoot, "rev-parse", "-q", "--verify", "HEAD^{commit}");
-    if (head !== null) writeFileSync(join(absDest, ".git", "HEAD"), `${head}\n`);
-    const index = gitMaybe(absRoot, "rev-parse", "--path-format=absolute", "--git-path", "index");
-    if (index !== null && existsSync(index)) {
-      copyFileSync(index, join(absDest, ".git", "index"), constants.COPYFILE_FICLONE);
-    }
-  }
   return true;
 }
 
@@ -524,8 +537,10 @@ export async function cloneTree(root: string, dest: string): Promise<void> {
     ? absDest.slice(absRoot.length + 1).split("/")[0] ?? null
     : null;
   if (cloneGitTree(absRoot, absDest, skipInsideRoot)) return;
+  rmSync(absDest, { recursive: true, force: true });
+  mkdirSync(absDest, { recursive: true });
   const entries = readdirSync(absRoot).filter(
-    (name) => !CLONE_SKIP_DIRS.has(name) && name !== skipInsideRoot,
+    (name) => !CLONE_SKIP_DIRS.has(name) && !name.startsWith(".bun-mutate") && name !== skipInsideRoot,
   );
   if (entries.length > 0 && (process.platform === "darwin" || process.platform === "linux")) {
     const flag = process.platform === "darwin" ? "-cRp" : "-al";
@@ -713,7 +728,7 @@ export async function measureCoverage(
     }
   };
   try {
-    const slots = Math.min(Math.max(2, Math.floor((cores * 2) / 3)), queue.length);
+    const slots = Math.min(Math.max(1, Math.floor(cores / 2)), queue.length);
     await Promise.all(
       Array.from({ length: slots }, async () => {
         for (let next = queue.shift(); next !== undefined; next = queue.shift()) await runOne(next);

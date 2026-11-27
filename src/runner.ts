@@ -302,6 +302,7 @@ export async function runMutationSpecs(opts: RunOptions): Promise<RunSummary> {
       schemataEncoded,
       rows,
       record,
+      warn,
       progress,
     });
   };
@@ -411,6 +412,7 @@ async function runIsolatedPool(ctx: {
   readonly schemataEncoded: number;
   readonly rows: ResultRow[];
   readonly record: (item: TargetItem, killed: VerdictMap) => void;
+  readonly warn: (message: string) => void;
   readonly progress: (message: string) => void;
 }): Promise<RunSummary> {
   const {
@@ -434,6 +436,7 @@ async function runIsolatedPool(ctx: {
     schemataEncoded,
     rows,
     record,
+    warn,
     progress,
   } = ctx;
   const cacheDir = opts.covCache ?? null;
@@ -528,6 +531,7 @@ async function runIsolatedPool(ctx: {
         record(item, finalizeRow(item.suites, priorById.get(item.mutant.id), raw, mode));
       }
     },
+    warn,
     progress,
   });
   return {
