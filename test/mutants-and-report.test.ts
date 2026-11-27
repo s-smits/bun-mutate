@@ -1,0 +1,164 @@
+import { describe, expect, it } from "bun:test";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import {
+  buildMarkdownReport,
+  classifyRow,
+  formatReportTable,
+  formatSurvivorClusters,
+  freshSurvivors,
+  mutantsFromSource,
+  recheckIdsOf,
+  runMutationSpecs,
+  survivorEntries,
+  verdictOf,
+  writeSurvivorsFile,
+} from "../src/index.ts";
+import type { ResultRow } from "../src/types.ts";
+
+describe("mutantsFromSource", () => {
+  it("generates expected syntactic mutations and skips inert nodes", () => {
+    const source = [
+      'import { join } from "node:path";',
+      "type Flag = true | false;",
+      "interface Pair { a: number; b: number; }",
+      "export function check(a: number, b: number, ok: boolean): number {",
+      "  console.log(a + b, ok === true);",
+      "  const msg = `sum=${a + b}`;",
+      "  if (!ok && a < b) return a + 1;",
+      "  return a >= b ? 10 : 20;",
+      "}",
+      "export const obj = { 1: true };",
+    ].join("\n");
+
+    const mutants = mutantsFromSource("src/sample.ts", source);
+    const labels = mutants.map((m) => m.label);
+
+    // Inert lines: import (1), type (2), interface (3), console.log (5), template literal (6)
+    expect(mutants.every((m) => ![1, 2, 3, 5, 6].includes(m.line))).toBe(true);
+    // Numeric property name `1` in `{ 1: true }` must not be mutated
+    expect(mutants.some((m) => m.line === 10 && m.label === "1 -> 2")).toBe(false);
+    // Boolean value in `{ 1: true }` IS mutated
+    expect(mutants.some((m) => m.line === 10 && m.label === "true -> false")).toBe(true);
+
+    expect(labels).toContain("delete if");
+    expect(labels).toContain("drop !");
+    expect(labels).toContain("&& -> ||");
+    expect(labels).toContain("< -> <=");
+    expect(labels).toContain("+ -> -");
+    expect(labels).toContain("1 -> 2");
+    expect(labels).toContain("swap ?:");
+    expect(labels).toContain(">= -> >");
+    expect(labels).toContain("10 -> 11");
+    expect(labels).toContain("20 -> 21");
+  });
+});
+
+describe("verdictOf and reporting", () => {
+  it("enforces strict verdict honesty (mixed false/null is unread)", () => {
+    expect(verdictOf({ a: true, b: null })).toBe("killed");
+    expect(verdictOf({ a: false, b: true })).toBe("killed");
+    expect(verdictOf({ a: false, b: false })).toBe("survived");
+    expect(verdictOf({ a: false, b: null })).toBe("unread");
+    expect(verdictOf({ a: null })).toBe("unread");
+    expect(verdictOf({})).toBe("unread");
+  });
+
+  it("classifies rows against an --old baseline suite", () => {
+    const mk = (killed: Record<string, boolean | null>): ResultRow => ({
+      id: "src/a.ts:1:+ -> -",
+      file: "src/a.ts",
+      line: 1,
+      label: "+ -> -",
+      killed,
+    });
+    expect(classifyRow(mk({ old: true, fresh: true }), "old")).toBe("ON");
+    expect(classifyRow(mk({ old: true, fresh: false }), "old")).toBe("O-");
+    expect(classifyRow(mk({ old: false, fresh: true }), "old")).toBe("-N");
+    expect(classifyRow(mk({ old: false, fresh: false }), "old")).toBe("--");
+    expect(classifyRow(mk({ old: true, fresh: null }), "old")).toBe("unread");
+    expect(classifyRow(mk({ old: null, fresh: false }), "old")).toBe("unread");
+  });
+
+  it("clusters survivors by file:line, diffs fresh survivors, and exports survivors.ids.txt", () => {
+    const dir = mkdtempSync(join(tmpdir(), "bm-report-"));
+    try {
+      const src = ["export function f(x: number) {", "  return x > 0 && x < 10;", "}"].join("\n");
+      writeFileSync(join(dir, "a.ts"), src);
+      const rows: ResultRow[] = [
+        { id: "a.ts:38:> -> >=", file: "a.ts", line: 2, label: "> -> >=", killed: { u: false } },
+        { id: "a.ts:43:&& -> ||", file: "a.ts", line: 2, label: "&& -> ||", killed: { u: false } },
+        { id: "a.ts:48:< -> <=", file: "a.ts", line: 2, label: "< -> <=", killed: { u: false } },
+        { id: "a.ts:50:10 -> 11", file: "a.ts", line: 2, label: "10 -> 11", killed: { u: true } },
+        { id: "a.ts:40:0 -> 1", file: "a.ts", line: 2, label: "0 -> 1", killed: { u: false, v: null } },
+      ];
+
+      const entries = survivorEntries(dir, rows);
+      expect(entries).toHaveLength(3);
+
+      const clusters = formatSurvivorClusters(entries);
+      expect(clusters).toEqual([
+        "- `a.ts:2  [3: > -> >=, && -> ||, < -> <=]  return x > 0 && x < 10;`",
+      ]);
+
+      const fresh = freshSurvivors(entries, entries.slice(0, 1));
+      expect(fresh.map((e) => e.label)).toEqual(["&& -> ||", "< -> <="]);
+
+      const ids = recheckIdsOf(rows);
+      expect(ids).toEqual([
+        "a.ts:38:> -> >=",
+        "a.ts:43:&& -> ||",
+        "a.ts:48:< -> <=",
+        "a.ts:40:0 -> 1",
+      ]);
+
+      const idsPath = join(dir, "survivors.ids.txt");
+      expect(writeSurvivorsFile(idsPath, ids)).toBe(true);
+      expect(readFileSync(idsPath, "utf8").trim().split("\n")).toEqual(ids);
+
+      const table = formatReportTable(rows);
+      expect(table).toContain("file  killed  survived  unread");
+      expect(table).toContain("a.ts  1  3  1");
+
+      const md = buildMarkdownReport({ root: dir, heading: "# Test", rows, idsFile: idsPath });
+      expect(md.killed).toBe(1);
+      expect(md.survived).toBe(3);
+      expect(md.unread).toBe(1);
+      expect(md.markdown).toContain(idsPath);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("emits an explicit stale --only IDs warning when byte offsets shifted", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "bm-stale-"));
+    try {
+      writeFileSync(join(dir, "math.ts"), "export function add(a: number, b: number) { return a + b; }\n");
+      writeFileSync(
+        join(dir, "math.test.ts"),
+        'import { expect, it } from "bun:test";\nimport { add } from "./math.ts";\nit("adds", () => { expect(add(1, 2)).toBe(3); });\n',
+      );
+      const warnings: string[] = [];
+      const res = await runMutationSpecs({
+        root: dir,
+        specs: [
+          {
+            file: "math.ts",
+            out: join(dir, "out.jsonl"),
+            suites: { math: ["math.test.ts"] },
+            ids: ["math.ts:999:+ -> -", "math.ts:1234:< -> <="],
+          },
+        ],
+        warn: (msg) => warnings.push(msg),
+      });
+      expect(res.run).toBe(0);
+      expect(res.staleWarnings).toHaveLength(1);
+      expect(res.staleWarnings[0]?.stale).toBe(2);
+      expect(res.staleWarnings[0]?.total).toBe(2);
+      expect(warnings[0]).toContain("stale --only IDs in math.ts: 2/2 matched no current mutant");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});

@@ -1,0 +1,35 @@
+export interface Mutant {
+  readonly id: string;
+  readonly file: string;
+  readonly line: number;
+  readonly label: string;
+  readonly start: number;
+  readonly end: number;
+  readonly text: string;
+}
+
+export type VerdictMap = Record<string, boolean | null>;
+
+export type VerdictKind = "killed" | "survived" | "unread";
+
+export interface ResultRow {
+  readonly id: string;
+  readonly file: string;
+  readonly line: number;
+  readonly label: string;
+  readonly killed: VerdictMap;
+}
+
+export interface TargetSpec {
+  readonly file: string;
+  readonly out: string;
+  readonly suites: Readonly<Record<string, readonly string[]>>;
+  readonly ids?: readonly string[];
+}
+
+export interface BatchPlan {
+  readonly mutant: Mutant;
+  readonly active: readonly string[];
+}
+
+export type KillMode = "stop-at-kill" | "all";
