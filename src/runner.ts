@@ -182,7 +182,8 @@ export async function runMutationSpecs(opts: RunOptions): Promise<RunSummary> {
   const enableSchemata = opts.schemata ?? prune;
   const seconds = opts.timeoutSeconds ?? 300;
   const deadline = opts.deadlineMs ?? Number.POSITIVE_INFINITY;
-  const concurrency = Math.max(1, Math.min(16, opts.concurrency ?? Math.min(8, availableParallelism())));
+  const defaultConc = Math.max(1, Math.min(8, Math.floor(availableParallelism() / 2)));
+  const concurrency = Math.max(1, Math.min(16, opts.concurrency ?? defaultConc));
   const warn = opts.warn ?? ((msg: string) => console.error(msg));
   const progress = opts.progress ?? (() => {});
 

@@ -69,7 +69,7 @@ export async function runLocalPool(opts: {
   const unreachedBySuite = new Map<string, Map<string, Set<string>>>();
   const cores = Math.max(1, availableParallelism());
   const localCount = opts.workers.length;
-  const baseConc = Math.min(4, Math.max(1, Math.floor(cores / Math.max(1, localCount))));
+  const baseConc = Math.min(2, Math.max(1, Math.floor(cores / Math.max(1, localCount * 2))));
   const qualifyWait = new Map<string, Promise<string | null>>();
   const badSuites = new Set<string>();
   const skippedSuites = new Map<string, string>();
@@ -217,12 +217,12 @@ export async function runLocalPool(opts: {
           opts.covered,
           opts.stopAtKill,
         );
-        // Adaptive tail concurrency: 1 under full load -> up to 4 as remaining tasks drain.
+        // Adaptive tail concurrency: 1 under full load -> up to 2 as remaining tasks drain.
         const runnablePending = pending.filter(
           (item) => !doneKeys.has(item.key) && !item.plan.active.some((name) => badSuites.has(name)),
         ).length;
         const demand = Math.min(localCount, Math.max(1, runnablePending + localInFlight));
-        const localConc = Math.min(4, Math.max(1, Math.floor(cores / demand)));
+        const localConc = Math.min(2, Math.max(1, Math.floor(cores / Math.max(1, demand * 2))));
         const outcome = await killsOf(seat, ordered, {
           originals: opts.originals,
           suites: opts.suites,
