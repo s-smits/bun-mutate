@@ -1,6 +1,7 @@
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { gitRaw } from "./git.ts";
+import { mutantsOf } from "./mutants.ts";
 import type { ResultRow, VerdictKind, VerdictMap } from "./types.ts";
 
 export function verdictOf(killed: Readonly<VerdictMap>): VerdictKind {
@@ -94,7 +95,7 @@ export function survivorEntries(
       }
       sources.set(row.file, text.split("\n"));
     }
-    const source = sources.get(row.file)?.[row.line - 1]?.trim() ?? "";
+    const source = row.source ?? sources.get(row.file)?.[row.line - 1]?.trim() ?? "";
     const key = `${row.file}  ${row.label}  ${source}`;
     const reached = row.reached ?? null;
     return [{ id: row.id, file: row.file, line: row.line, label: row.label, source, key, reached }];
@@ -256,4 +257,55 @@ export function buildMarkdownReport(opts: {
     recheckIds,
     stale,
   };
+}
+
+export interface Recheck {
+  /** Mutant IDs at the current tree, by file, that carry an earlier run's open rows. */
+  readonly targets: Map<string, string[]>;
+  /** Open rows whose file, line text or operator no longer exists at the current tree. */
+  readonly gone: number;
+  /** Open rows re-anchored to at least one current mutant. */
+  readonly anchored: number;
+}
+
+/**
+ * Finds an earlier run's survivors and unread mutants at the current tree, so tests added since can
+ * be checked without a full run. A row anchors to every current mutant with its label on a line whose
+ * trimmed text matches the row's, nearest its old line first; rows written before `source` was
+ * recorded anchor by ID alone. Answered survivors are left out.
+ */
+export function recheckTargets(
+  root: string,
+  rows: readonly ResultRow[],
+  answered: ReadonlySet<string> = new Set(),
+): Recheck {
+  const targets = new Map<string, string[]>();
+  const current = new Map<string, ReturnType<typeof mutantsOf>>();
+  const latest = new Map<string, ResultRow>();
+  for (const row of rows) latest.set(row.id, row);
+  let gone = 0;
+  let anchored = 0;
+  for (const row of latest.values()) {
+    const verdict = verdictOf(row.killed);
+    if (verdict === "killed") continue;
+    if (verdict === "survived" && answered.has(`${row.file}  ${row.label}  ${row.source ?? ""}`)) continue;
+    if (!current.has(row.file)) {
+      current.set(row.file, existsSync(join(root, row.file)) ? mutantsOf(root, row.file) : []);
+    }
+    const same = (current.get(row.file) ?? []).filter(
+      (mutant) =>
+        mutant.label === row.label && (row.source === undefined ? mutant.id === row.id : mutant.source === row.source),
+    );
+    const nearest = Math.min(...same.map((mutant) => Math.abs(mutant.line - row.line)));
+    const ids = same.filter((mutant) => Math.abs(mutant.line - row.line) === nearest).map(({ id }) => id);
+    if (ids.length === 0) {
+      gone += 1;
+      continue;
+    }
+    anchored += 1;
+    const list = targets.get(row.file) ?? [];
+    for (const id of ids) if (!list.includes(id)) list.push(id);
+    targets.set(row.file, list);
+  }
+  return { targets, gone, anchored };
 }

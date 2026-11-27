@@ -110,11 +110,21 @@ function edits(node: ts.Node, tree: ts.SourceFile): [number, number, string, str
 export function mutantsFromSource(file: string, source: string): Mutant[] {
   const tree = ts.createSourceFile(file, source, ts.ScriptTarget.Latest, true, scriptKindFor(file));
   const found: Mutant[] = [];
+  const lines = source.split("\n");
   const visit = (node: ts.Node): void => {
     if (isInert(node)) return;
     for (const [start, end, text, label] of edits(node, tree)) {
       const line = tree.getLineAndCharacterOfPosition(start).line + 1;
-      found.push({ id: `${file}:${String(start)}:${label}`, file, line, label, start, end, text });
+      found.push({
+        id: `${file}:${String(start)}:${label}`,
+        file,
+        line,
+        label,
+        start,
+        end,
+        text,
+        source: lines[line - 1]?.trim() ?? "",
+      });
     }
     ts.forEachChild(node, visit);
   };

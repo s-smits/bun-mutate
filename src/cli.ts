@@ -19,6 +19,7 @@ import {
   survivorLineCount,
   readAnswers,
   recheckIdsOf,
+  recheckTargets,
   rowsOf,
   survivorEntries,
   writeSurvivorsFile,
@@ -43,11 +44,13 @@ Options:
   --out-dir <dir>          Directory for results.jsonl, report.md, and survivors.ids.txt
   --suites <json>          Explicit JSON map of { suiteName: ["path/to/test.ts"] }
   --only <file>            Newline-separated mutant IDs to run (warns on stale offsets)
+  --recheck <jsonl>        Rerun an earlier run's unanswered survivors and unread mutants at this tree
   -j, --jobs, --concurrency <n>  Parallel worker count (default: min(8, CPU cores))
   --timeout <s>            Per-mutant/suite wall timeout cap in seconds (default: 300)
   --all                    Run every suite even after a kill (default stops at first kill)
   --no-prune               Disable in-process schemata and LCOV coverage pruning
   --no-schemata            Disable in-process schemata (run every suite in isolated clones)
+  --no-typecheck           Leave survivors unscreened by tsc (default screens them when tsconfig.json exists)
   --cov-cache <dir>        Cache baseline suite durations and LCOV coverage
   --clones <prefix>        Reusable directory prefix for isolated clones
   --depth <n|all>          Import-hop depth for test selection (default: all; 1 = direct importers with transitive fallback)
@@ -73,6 +76,7 @@ const VALUE_FLAGS = new Set([
   "state",
   "suites",
   "only",
+  "recheck",
   "jobs",
   "concurrency",
   "timeout",
@@ -91,6 +95,7 @@ const BOOL_FLAGS = new Set([
   "prune",
   "no-prune",
   "no-schemata",
+  "no-typecheck",
   "survivors",
   "no-fail",
   "fail-on-survivors",
@@ -251,6 +256,14 @@ function handleList(root: string, files: readonly string[], flags: ReadonlyMap<s
   }
 }
 
+function stayAwake(): void {
+  try {
+    Bun.spawn(["caffeinate", "-i", "-w", String(process.pid)], { stdio: ["ignore", "ignore", "ignore"] }).unref();
+  } catch {
+    // Only macOS ships caffeinate; elsewhere the spawn throws ENOENT and the run goes on.
+  }
+}
+
 function answersOf(root: string, flags: ReadonlyMap<string, string | true>): ReadonlySet<string> {
   const named = strFlag(flags, "answers");
   return readAnswers(named === null ? join(root, "answered-survivors.tsv") : resolve(named));
@@ -300,10 +313,19 @@ async function handleRun(
   const outDirFlag = strFlag(flags, "out-dir", "state");
   const outFlag = strFlag(flags, "out");
   const head = gitMaybe(root, "rev-parse", "--short=9", "HEAD") ?? "worktree";
-  const defaultDir = join(root, ".bun-mutate", isDiff ? `diff-${head}` : `run-${head}`);
+  const recheckPath = strFlag(flags, "recheck");
+  const defaultDir = join(
+    root,
+    ".bun-mutate",
+    recheckPath !== null ? `recheck-${head}` : isDiff ? `diff-${head}` : `run-${head}`,
+  );
   const outDir = outDirFlag !== null ? resolve(outDirFlag) : outFlag !== null ? dirname(resolve(outFlag)) : defaultDir;
   const outPath = outFlag !== null ? resolve(outFlag) : join(outDir, "results.jsonl");
   mkdirSync(dirname(outPath), { recursive: true });
+  if (recheckPath !== null) {
+    if (outFlag === null && outDirFlag === null) rmSync(outPath, { force: true });
+    else if (existsSync(outPath)) die(`--recheck writes fresh results, and ${outPath} already exists`);
+  }
 
   const suitesPath = strFlag(flags, "suites");
   const explicitSuites =
@@ -324,7 +346,15 @@ async function handleRun(
   let targetFiles: string[];
   let diffIdsByFile: Map<string, string[]> | null = null;
 
-  if (isDiff) {
+  if (recheckPath !== null) {
+    if (isDiff || onlyIds !== undefined) die("--recheck takes neither --diff nor --only");
+    const recheck = recheckTargets(root, rowsOf(resolve(recheckPath)), answersOf(root, flags));
+    console.error(
+      `recheck: ${String(recheck.anchored)} open row(s) found at this tree, ${String(recheck.gone)} on lines since changed or removed`,
+    );
+    diffIdsByFile = recheck.targets;
+    targetFiles = [...recheck.targets.keys()];
+  } else if (isDiff) {
     const resolved = resolveDiffTargets(root, diffRefArg, explicitFiles);
     diffRef = resolved.ref;
     diffIdsByFile = resolved.targets;
@@ -396,6 +426,7 @@ async function handleRun(
   const deadlineMs = parseDeadline(strFlag(flags, "until"));
 
   const started = Date.now();
+  stayAwake();
   const quiet = flags.has("quiet") || flags.has("json");
   const summary = await runMutationSpecs({
     root,
@@ -409,6 +440,7 @@ async function handleRun(
     timeoutSeconds,
     deadlineMs,
     testIndex: index ?? undefined,
+    typecheck: !flags.has("no-typecheck"),
     progress: quiet ? undefined : (msg) => console.error(msg),
   });
   const elapsedSec = ((Date.now() - started) / 1000).toFixed(1);
@@ -432,7 +464,7 @@ async function handleRun(
       untested,
       idsFile: ids,
       answered: answersOf(root, flags),
-      listStale: !isDiff && explicitFiles.length === 0,
+      listStale: !isDiff && recheckPath === null && explicitFiles.length === 0,
     });
   const wroteIds = writeSurvivorsFile(idsFile, reportOf(null).recheckIds);
   if (!wroteIds) rmSync(idsFile, { force: true });
@@ -485,7 +517,7 @@ async function handleRun(
     return 1;
   }
   const hasGap = report.open > 0 || report.unread > 0 || (isDiff && untested.length > 0);
-  if ((isDiff || flags.has("fail-on-survivors")) && !flags.has("no-fail") && hasGap) {
+  if ((isDiff || recheckPath !== null || flags.has("fail-on-survivors")) && !flags.has("no-fail") && hasGap) {
     return 3;
   }
   return 0;

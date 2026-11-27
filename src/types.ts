@@ -6,6 +6,8 @@ export interface Mutant {
   readonly start: number;
   readonly end: number;
   readonly text: string;
+  /** The trimmed source line the mutant sits on, which anchors it across edits. */
+  readonly source: string;
 }
 
 export type VerdictMap = Record<string, boolean | null>;
@@ -20,6 +22,8 @@ export interface ResultRow {
   readonly killed: VerdictMap;
   /** Suites that ran with the mutant active; the rest skipped it because their coverage never reaches its line. */
   readonly reached?: readonly string[];
+  /** The trimmed source line at run time, so answers and rechecks survive later edits. */
+  readonly source?: string;
 }
 
 export interface TargetSpec {

@@ -19,8 +19,8 @@ bun-mutate run [files...]
 # Preview mutant counts without running tests
 bun-mutate list [--diff [base]] [files...]
 
-# Re-run only surviving and unread mutant IDs after edits
-bun-mutate run [files...] --only .bun-mutate/<run>/survivors.ids.txt
+# Re-run an earlier run's open survivors and unread mutants after edits, re-anchored by source line
+bun-mutate run --recheck .bun-mutate/<run>/results.jsonl
 
 # Summarise recorded JSONL rows (solo or comparative against --old <suite>)
 bun-mutate report <results.jsonl...> [--old <suite>] [--survivors]
@@ -78,12 +78,12 @@ Never chase raw survivor counts by adding isolated unit tests with synthetic stu
 
 4. **Prove every fix against the oracle (watch for mutation rot).**
    - Mutant IDs encode `<file>:<byteOffset>:<label>`. Editing code above a survivor shifts byte offsets so an old `survivors.ids.txt` may match nothing (`bun-mutate` prints a `stale --only IDs` warning on `stderr`). Never treat `0 mutants run` as proof a fix worked.
-   - Re-run `bun-mutate diff` (or `bun-mutate run <edited-files>`) against the current tree and confirm every targeted line flips from `survived` to `killed` with `0 unread`. A mutant that still survives on a line you edited a test for proves the test is inert — fix the fixture or delete the test.
+   - Confirm with `bun-mutate run --recheck <out-dir>/results.jsonl`: it finds each open row at the current tree by its recorded source line and operator, so line shifts don't lose it, and every targeted line must flip from `survived` to `killed` with `0 unread`. A `--diff` run alone never revisits a survivor you pinned by editing a test, because the source line did not change. Rows the recheck reports as gone sit on edited lines; mutate their new text with `bun-mutate diff <earlier commit>`. A mutant that still survives on a line you edited a test for proves the test is inert — fix the fixture or delete the test.
    - Re-run your full project typecheck and test suite after the final edit.
 
 ## Verdict Honesty
 
-- `killed`: at least one qualified suite failed with the mutant applied (and passed unmutated).
+- `killed`: at least one qualified suite failed with the mutant applied (and passed unmutated). A survivor whose mutated tree fails `tsc --noEmit` (other than unused or unreachable-code diagnostics) is recorded as killed under `typecheck`; pass `--no-typecheck` to skip that screen.
 - `survived`: every covering suite passed cleanly (`false`) with zero missing verdicts.
 - `unread`: at least one suite timed out, crashed, or gave no verdict and no other suite killed the mutant; excluded from the mutation score `killed / (killed + survived)`.
 - Suites that fail unmutated are retried once at one worker and twice the wall, then isolated rather than recording false kills.

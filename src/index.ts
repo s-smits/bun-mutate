@@ -56,6 +56,7 @@ export {
   freshSurvivors,
   mutationScore,
   recheckIdsOf,
+  recheckTargets,
   rowsOf,
   survivorEntries,
   verdictOf,

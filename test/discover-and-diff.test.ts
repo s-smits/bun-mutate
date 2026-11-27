@@ -1,5 +1,5 @@
 import { describe, expect, it } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -13,8 +13,10 @@ import {
   discoverTestFiles,
   resolveDiffRef,
   rowsOf,
+  recheckTargets,
   verdictOf,
 } from "../src/index.ts";
+import { hasTypeError } from "../src/runner.ts";
 
 const CLI = join(import.meta.dir, "..", "src", "cli.ts");
 
@@ -408,5 +410,137 @@ describe("git diff parsing and zero-flag diff-hunk mode", () => {
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
+  });
+
+  it("rechecks an earlier run's survivors after the file shifted and a test grew, starting fresh", () => {
+    const dir = mkdtempSync(join(tmpdir(), "bm-recheck-"));
+    try {
+      mkdirSync(join(dir, "src"), { recursive: true });
+      mkdirSync(join(dir, "test"), { recursive: true });
+      const code = ["export function clamp(x: number) {", "  if (x > 10) return 10;", "  return x;", "}"];
+      writeFileSync(join(dir, "src", "ops.ts"), `${code.join("\n")}\n`);
+      const testOf = (lines: string[]) =>
+        `${['import { expect, it } from "bun:test";', 'import { clamp } from "../src/ops.ts";', 'it("clamps", () => {', ...lines, "});"].join("\n")}\n`;
+      writeFileSync(join(dir, "test", "ops.test.ts"), testOf(["  expect(clamp(5)).toBe(5);"]));
+      const cli = (...args: string[]) => {
+        const res = Bun.spawnSync([process.execPath, CLI, ...args, "--root", dir, "-q"], { stdout: "pipe", stderr: "pipe" });
+        return { code: res.exitCode, err: new TextDecoder().decode(res.stderr) };
+      };
+
+      const staleRow = ["src/ops.ts", "< -> <=", "return x < 0;", "equivalent", "a row whose line is long gone"];
+      writeFileSync(join(dir, "answered-survivors.tsv"), `${staleRow.join("\t")}\n`);
+      const stale = (out: string) => readFileSync(join(dir, out, "report.md"), "utf8").includes("Stale answer");
+      expect(cli("run", "src/ops.ts", "--out-dir", join(dir, "a")).code).toBe(0);
+      expect(cli("run", "--out-dir", join(dir, "full")).code).toBe(0);
+      expect([stale("a"), stale("full")]).toEqual([false, true]);
+      const first = rowsOf(join(dir, "a", "results.jsonl"));
+      const open = first.filter((row) => verdictOf(row.killed) !== "killed");
+      expect(open.map((row) => row.label)).toContain("delete if");
+      expect(open.every((row) => row.source === "if (x > 10) return 10;")).toBe(true);
+
+      writeFileSync(join(dir, "src", "ops.ts"), `${["// Caps a value at ten.", ...code].join("\n")}\n`);
+      writeFileSync(
+        join(dir, "test", "ops.test.ts"),
+        testOf(["  expect(clamp(5)).toBe(5);", "  expect(clamp(11)).toBe(10);", "  expect(clamp(10)).toBe(10);"]),
+      );
+      const rechecked = cli("run", "--recheck", join(dir, "a", "results.jsonl"));
+      expect(rechecked.err).toContain(`recheck: ${String(open.length)} open row(s) found at this tree, 0 on lines since changed`);
+      const again = rowsOf(join(dir, ".bun-mutate", "recheck-worktree", "results.jsonl"));
+      expect(stale(join(".bun-mutate", "recheck-worktree"))).toBe(false);
+      expect(new Set(again.map((row) => row.line))).toEqual(new Set([3]));
+      expect(again.filter((row) => verdictOf(row.killed) !== "killed").map((row) => row.label)).toEqual(["> -> >="]);
+      expect(rechecked.code).toBe(3);
+
+      // A second recheck starts its default output fresh instead of resuming the first by ID.
+      writeFileSync(join(dir, "test", "ops.test.ts"), testOf(["  expect(clamp(5)).toBe(5);"]));
+      expect(cli("run", "--recheck", join(dir, "a", "results.jsonl")).code).toBe(3);
+      const third = rowsOf(join(dir, ".bun-mutate", "recheck-worktree", "results.jsonl"));
+      expect(third.filter((row) => verdictOf(row.killed) !== "killed").map((row) => row.label)).toContain("delete if");
+      expect(cli("run", "--recheck", join(dir, "a", "results.jsonl"), "--out-dir", join(dir, "a")).err).toContain(
+        "--recheck writes fresh results",
+      );
+      const ids = join(dir, "a", "survivors.ids.txt");
+      expect(cli("run", "--recheck", join(dir, "a", "results.jsonl"), "--only", ids).err).toContain(
+        "--recheck takes neither --diff nor --only",
+      );
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("anchors open rows by line text and label, counting changed lines as gone and skipping answers", () => {
+    const dir = mkdtempSync(join(tmpdir(), "bm-anchor-"));
+    try {
+      writeFileSync(join(dir, "a.ts"), "export const f = (x: number) => x > 0;\nexport const g = (y: number) => y < 9;\n");
+      const row = (id: string, line: number, label: string, source: string | undefined, killed: boolean | null) => ({
+        id,
+        file: "a.ts",
+        line,
+        label,
+        killed: { s: killed },
+        ...(source === undefined ? {} : { source }),
+      });
+      const rows = [
+        row("a.ts:1:> -> >=", 1, "> -> >=", "export const f = (x: number) => x > 0;", false),
+        row("a.ts:2:< -> <=", 2, "< -> <=", "export const g = (y: number) => y < 10;", false),
+        row("a.ts:3:9 -> 10", 2, "9 -> 10", "export const g = (y: number) => y < 9;", true),
+        row("a.ts:4:9 -> 10", 2, "9 -> 10", "export const g = (y: number) => y < 9;", false),
+        row("a.ts:73:< -> <=", 2, "< -> <=", undefined, null),
+        row("a.ts:999:> -> <", 1, "> -> <", undefined, false),
+      ];
+      const answered = new Set(["a.ts  9 -> 10  export const g = (y: number) => y < 9;"]);
+      const found = recheckTargets(dir, rows, answered);
+      expect([found.anchored, found.gone]).toEqual([2, 2]);
+      expect(found.targets.get("a.ts")?.toSorted()).toEqual(["a.ts:34:> -> >=", "a.ts:73:< -> <="]);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("kills a lone survivor whose mutated tree fails tsc, unless --no-typecheck or the tree already fails", () => {
+    const dir = mkdtempSync(join(tmpdir(), "bm-typecheck-"));
+    try {
+      mkdirSync(join(dir, "src"), { recursive: true });
+      mkdirSync(join(dir, "test"), { recursive: true });
+      symlinkSync(join(import.meta.dir, "..", "node_modules"), join(dir, "node_modules"));
+      writeFileSync(
+        join(dir, "tsconfig.json"),
+        JSON.stringify({ compilerOptions: { strict: true, noUnusedLocals: true, types: [] }, include: ["src"] }),
+      );
+      writeFileSync(
+        join(dir, "src", "len.ts"),
+        "export function len(x: string | null): number {\n  if (x === null) throw new TypeError();\n  return x.length;\n}\n",
+      );
+      writeFileSync(
+        join(dir, "test", "len.test.ts"),
+        'import { expect, it } from "bun:test";\nimport { len } from "../src/len.ts";\nit("len", () => {\n  expect(len("ab")).toBe(2);\n  expect(() => len(null)).toThrow();\n});\n',
+      );
+      writeFileSync(join(dir, "src", "cap.ts"), "export const cap = (n: number): number => Math.min(n, 9);\n");
+      writeFileSync(
+        join(dir, "test", "cap.test.ts"),
+        'import { expect, it } from "bun:test";\nimport { cap } from "../src/cap.ts";\nit("cap", () => {\n  expect(cap(1)).toBe(1);\n});\n',
+      );
+      const verdicts = (file: string, out: string, ...flags: string[]) => {
+        const args = ["run", file, "--root", dir, "--out-dir", join(dir, out), "-q", ...flags];
+        Bun.spawnSync([process.execPath, CLI, ...args]);
+        const rows = rowsOf(join(dir, out, "results.jsonl"));
+        return rows.filter((row) => verdictOf(row.killed) !== "killed").map((row) => row.label);
+      };
+      expect(verdicts("src/len.ts", "screened")).toEqual([]);
+      expect(verdicts("src/cap.ts", "typed")).toEqual(["9 -> 10"]);
+      expect(verdicts("src/len.ts", "unscreened", "--no-typecheck")).toEqual(["delete if"]);
+      writeFileSync(join(dir, "src", "broken.ts"), 'export const n: number = "x";\n');
+      expect(verdicts("src/len.ts", "broken")).toEqual(["delete if"]);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("counts only diagnostics other than unused or unreachable code as a type error", () => {
+    const line = (code: string) => `src/a.ts(3,7): error TS${code}: message`;
+    expect(hasTypeError("")).toBe(false);
+    expect(hasTypeError([line("6133"), line("6196"), line("7027")].join("\n"))).toBe(false);
+    expect(hasTypeError([line("6133"), line("2322")].join("\n"))).toBe(true);
+    expect(hasTypeError(line("18047"))).toBe(true);
   });
 });

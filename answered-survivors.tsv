@@ -1,2 +1,4 @@
 path	label	source	kind	reason
 src/cli.ts	swap ?:	recheckPath !== null ? `recheck-${head}` : isDiff ? `diff-${head}` : `run-${head}`,	presentation	it swaps only the default output folder's name between diff and run passes, which each still resume their own rows
+src/runner.ts	delete if	if (held.length === 0 || !existsSync(join(root, "tsconfig.json")) || !existsSync(tsc)) return new Set();	equivalent	it only spares a whole-tree clone: with no survivor the loop screens nothing, with no tsconfig the baseline tsc fails with TS5057, and with no compiler no output carries a TS code
+src/runner.ts	|| -> &&	if (held.length === 0 || !existsSync(join(root, "tsconfig.json")) || !existsSync(tsc)) return new Set();	equivalent	it only spares a whole-tree clone: with no survivor the loop screens nothing, with no tsconfig the baseline tsc fails with TS5057, and with no compiler no output carries a TS code

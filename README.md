@@ -27,7 +27,7 @@ bun run src/cli.ts diff
 bun-mutate diff
 bun-mutate run src/math.ts
 bun-mutate list --diff
-bun-mutate run src/math.ts --only .bun-mutate/run-worktree/survivors.ids.txt
+bun-mutate run --recheck .bun-mutate/run-worktree/results.jsonl
 ```
 
 ## Zero-Config Repository Inference
@@ -70,6 +70,7 @@ Handles subprocess-spawning suites, unencoded sites, and schemata handoffs:
 | `--suites <json>` / `--only <file>` | Explicit suite map or mutant ID filter (warns on stale byte offsets). |
 | `-j, --jobs <n>` / `--timeout <s>` | Parallel worker cap (`min(8, cores)`) and per-suite timeout cap (`300s`). |
 | `--all` / `--no-prune` / `--no-schemata` | Disable stop-at-kill, coverage pruning, or in-process schemata. |
+| `--no-typecheck` | Leave survivors unscreened by `tsc`. |
 | `--cov-cache <dir>` / `--clones <prefix>` | Reuse mtime-validated coverage caches or clean clone directories. |
 | `--depth <n\|all>` / `--until <ISO\|HH:MM>` | Import-hop depth (default `all`, every test that reaches the file; `1` = direct importers + transitive fallback) and graceful deadline. |
 | `--old <suite>` / `--survivors` / `-q` | Compare against a baseline suite, list survivor/unread IDs, or quiet progress. |
@@ -83,6 +84,7 @@ Handles subprocess-spawning suites, unencoded sites, and schemata handoffs:
 - **Clustered triage:** survivors group by `file:line` with operator counts and source snippets. Each result row records the suites that ran with its mutant active (`reached`; the rest skipped it because their coverage never reaches the line), and each cluster names them: a line some suite runs wants an assertion in one of them, and a line no suite reaches is a deletion candidate or wants an end-to-end entry point.
 - **Baseline retry:** a suite that fails unmutated under parallel load gets one retry at one worker and twice its wall before it is skipped.
 - **Rows carry their source line:** each result row records the trimmed line its mutant sat on, so the report, the ledger and `--recheck` read the line as it was when the mutant ran, not whatever sits at that line number after later edits.
+- **Typecheck screen:** when the root has `tsconfig.json` and `node_modules/typescript`, every survivor is screened once more through `tsc --noEmit` (incremental, in one clone) and recorded as killed under `typecheck` when its mutated tree fails to compile, as a removed narrowing guard does. Unused and unreachable diagnostics (`TS6133`, `TS6196`, `TS7027` and their kin) do not count, since they flag dead code a mutant left behind rather than a change in behaviour. If the unmutated tree already fails `tsc`, survivors stay unscreened. Library callers opt in with `typecheck: true`; the CLI screens by default.
 - **Awake for the run:** on macOS the run holds an idle-sleep assertion (`caffeinate -i -w <pid>`) until it exits. A closed lid on battery still sleeps the machine; mutants it interrupts read as unread, never as kills, and `--recheck` reruns them.
 
 ## Triaging Survivors (Simplify Before Testing)
@@ -130,6 +132,13 @@ The reason must be a sentence a reviewer can check. Answered survivors drop out 
 
 - `.agents/skills/bun-mutate/SKILL.md` (Antigravity, Codex, OpenCode, Cursor, and other `.agents`-compatible ADEs)
 - `.claude/skills/bun-mutate/SKILL.md` (Claude Code)
+
+ADEs read skills from the repository, not from `node_modules`, so a consuming project copies them in after installing:
+
+```sh
+bun add -d github:s-smits/bun-mutate
+for d in .claude .agents; do mkdir -p $d/skills && cp -R node_modules/bun-mutate/$d/skills/bun-mutate $d/skills/; done
+```
 
 ## License
 

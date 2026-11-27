@@ -5,11 +5,58 @@ import { collectSuiteHelperDeps, type TestIndex } from "./discover.ts";
 import { cloneTree, linkModules, type LocalWorker, measureCoverage, spawnsSubprocess } from "./exec.ts";
 import { gitMaybe } from "./git.ts";
 import { mutantsOf } from "./mutants.ts";
+import { verdictOf } from "./report.ts";
 import { type PoolTask, runLocalPool, UNKNOWN_SUITE_MS } from "./pool.ts";
 import { screenFileWithSchemata } from "./schemata.ts";
 import type { KillMode, Mutant, ResultRow, TargetSpec, VerdictMap } from "./types.ts";
 
 const STAMP_FILE = ".bun-mutate-stamp";
+
+// Unused and unreachable diagnostics flag dead code a mutant left behind, not a change in behaviour.
+const DEAD_CODE_DIAGNOSTICS = new Set(["6133", "6138", "6192", "6196", "6198", "6199", "6205", "7027", "7028"]);
+
+export function hasTypeError(output: string): boolean {
+  return [...output.matchAll(/error TS(\d+):/gu)].some(([, code]) => !DEAD_CODE_DIAGNOSTICS.has(code ?? ""));
+}
+
+/** Marks each survivor whose mutated tree fails `tsc --noEmit` as killed under `typecheck`. */
+async function typecheckSurvivors(
+  root: string,
+  originals: ReadonlyMap<string, string>,
+  held: readonly Mutant[],
+  progress: (message: string) => void,
+): Promise<ReadonlySet<string>> {
+  const tsc = join(root, "node_modules", "typescript", "bin", "tsc");
+  if (held.length === 0 || !existsSync(join(root, "tsconfig.json")) || !existsSync(tsc)) return new Set();
+  const clone = mkdtempSync(join(tmpdir(), "bun-mutate-typecheck-"));
+  const check = () => {
+    const ran = Bun.spawnSync(
+      [process.execPath, tsc, "--noEmit", "--incremental", "--tsBuildInfoFile", join(clone, ".tsbuildinfo"), "-p", "."],
+      { cwd: clone, stdout: "pipe", stderr: "pipe" },
+    );
+    return hasTypeError(`${ran.stdout.toString()}${ran.stderr.toString()}`);
+  };
+  try {
+    await cloneTree(root, clone);
+    linkModules(root, clone);
+    if (check()) {
+      progress("typecheck: the unmutated tree fails tsc, so survivors stay unscreened");
+      return new Set();
+    }
+    const failed = new Set<string>();
+    for (const mutant of held) {
+      const orig = originals.get(mutant.file) ?? "";
+      const path = join(clone, mutant.file);
+      writeFileSync(path, orig.slice(0, mutant.start) + mutant.text + orig.slice(mutant.end));
+      if (check()) failed.add(mutant.id);
+      writeFileSync(path, orig);
+    }
+    progress(`typecheck: ${String(failed.size)}/${String(held.length)} survivor(s) fail tsc`);
+    return failed;
+  } finally {
+    rmSync(clone, { recursive: true });
+  }
+}
 
 interface TargetItem {
   readonly mutant: Mutant;
@@ -41,6 +88,7 @@ export interface RunOptions {
   readonly timeoutSeconds?: number;
   readonly deadlineMs?: number;
   readonly testIndex?: TestIndex;
+  readonly typecheck?: boolean;
   readonly warn?: (message: string) => void;
   readonly progress?: (message: string) => void;
 }
@@ -204,7 +252,25 @@ export async function runMutationSpecs(opts: RunOptions): Promise<RunSummary> {
   const rows: ResultRow[] = [];
   const madeDirs = new Set<string>();
   const priorReach = new Map<string, Set<string>>();
+  const held: { readonly item: TargetItem; readonly killed: VerdictMap; readonly raw: Readonly<VerdictMap> }[] = [];
+  const screen = opts.typecheck === true;
   const record = (item: TargetItem, killed: VerdictMap, raw: Readonly<VerdictMap> = {}) => {
+    if (screen && verdictOf(killed) === "survived") held.push({ item, killed, raw });
+    else write(item, killed, raw);
+  };
+  const settle = async (summary: RunSummary): Promise<RunSummary> => {
+    const failed = await typecheckSurvivors(
+      opts.root,
+      originals,
+      held.map(({ item }) => item.mutant),
+      progress,
+    );
+    for (const { item, killed, raw } of held) {
+      write(item, failed.has(item.mutant.id) ? { ...killed, typecheck: true } : killed, raw);
+    }
+    return { ...summary, run: rows.length };
+  };
+  const write = (item: TargetItem, killed: VerdictMap, raw: Readonly<VerdictMap>) => {
     const dir = dirname(item.out);
     if (!madeDirs.has(dir)) {
       mkdirSync(dir, { recursive: true });
@@ -217,6 +283,7 @@ export async function runMutationSpecs(opts: RunOptions): Promise<RunSummary> {
       label: item.mutant.label,
       killed,
       reached: item.suites.filter((name) => name in raw || priorReach.get(item.mutant.id)?.has(name) === true),
+      source: item.mutant.source,
     };
     appendFileSync(item.out, `${JSON.stringify(row)}\n`);
     rows.push(row);
@@ -391,10 +458,10 @@ export async function runMutationSpecs(opts: RunOptions): Promise<RunSummary> {
         progress(
           `schemata: ${String(rows.length)}/${String(todo.length)} settled in ${sec}s (${String(after.length)} remaining)`,
         );
-        return await finishPool(after);
+        return await settle(await finishPool(after));
       }
     }
-    return await finishPool(splitAfterSchema(todo, priorById, mode, record));
+    return await settle(await finishPool(splitAfterSchema(todo, priorById, mode, record)));
   } finally {
     if (ephemeralRoot !== null) rmSync(ephemeralRoot, { recursive: true, force: true });
   }
